@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.27.0
+// @version      3.28.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.27.0';
+var VERSION = '3.28.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -221,7 +221,7 @@ function toggleMode() {
   }
   asStop(true); dropPeek(); fadeCover(true);
   var finish = function () {
-    box = null; imgCount = -1; bigImgs = []; findBox();
+    resetBox(); findBox();
     var end = function () { fadeCover(false); switching = false; onScroll(); };
     if (p > 2 && p < 95) restore(p, a, { quiet: true, fast: true, done: end });
     else { window.scrollTo(0, p >= 95 ? document.documentElement.scrollHeight : 0); end(); }
@@ -333,7 +333,8 @@ function buildReader() {
     '#mhub-nav{display:flex!important;gap:8px;max-width:820px;margin:0 auto;padding:18px 12px 120px;background:#000;font:700 15px system-ui,sans-serif}' +
     '#mhub-nav a{flex:1;display:flex;align-items:center;justify-content:center;min-height:52px;border-radius:12px;background:#2a2639;color:#ece9f6;text-decoration:none;text-align:center;padding:0 10px}' +
     '#mhub-nav a.nx{background:#913fe2;color:#fff;flex:1.4}#mhub-nav span{flex:1.4;display:flex;align-items:center;justify-content:center;color:#9893b0}' +
-    '#mhub-reader{display:block!important;background:#000;padding:0;margin:0;touch-action:manipulation}' +
+    // pan-y: der Browser scrollt senkrecht selbst und muss nie auf das Skript warten; waagerecht gehört dem Wischen
+    '#mhub-reader{display:block!important;background:#000;padding:0;margin:0;touch-action:pan-y pinch-zoom}' +
     '#mhub-reader img{display:block;width:100%;max-width:820px;height:auto;margin:0 auto;border:0}';
   (document.head || document.documentElement).appendChild(readerStyle);
   document.body.appendChild(reader);
@@ -353,7 +354,7 @@ function buildReader() {
     }, 700);
   });
   readerObs.observe(src, { subtree: true, childList: true, attributes: true, attributeFilter: ['src', 'data-src', 'srcset'] });
-  box = null; imgCount = -1; bigImgs = [];
+  resetBox();
   window.scrollTo(0, 0);
   return true;
 }
@@ -364,8 +365,6 @@ function teardownReader() {
   if (readerNav && readerNav.parentNode) readerNav.parentNode.removeChild(readerNav);
   reader = null; readerStyle = null; readerSrcs = {}; readerNav = null;
 }
-// Knöpfe am Kapitelende im Lesemodus: vorheriges Kapitel, Serienseite, nächstes Kapitel.
-// Links stammen von der Seite selbst; fehlt einer, wird er gebaut, wenn der Hub das Kapitel kennt.
 var CHPART = /((?:chapter|chap|ch|episode|ep)[-_\/ .]?)(\d+(?:[-_.]\d+)?)/i;
 // Vorheriges/nächstes Kapitel und Serienseite. Links stammen von der Seite; fehlt einer, wird er gebaut, wenn der Hub das Kapitel kennt
 function chapterTargets() {
@@ -386,7 +385,6 @@ function chapterTargets() {
   var home = head.replace(/[-_\/]+$/, ''), homeUrl = isSeriesUrl(location.origin + home) ? location.origin + home : '';
   return { prev: prev, prevN: prevN, next: next, nextN: nextN, homeUrl: homeUrl };
 }
-// Als gelesen speichern und zum nächsten Kapitel
 // Beim Verlassen die echte Stelle speichern, damit man beim Zurückkommen dort landet. Fast am Ende zählt als fertig
 function leaveChapter() {
   var m = measure(); if (m >= 0) { cur = m; curA = anchor() || curA; }
@@ -414,6 +412,26 @@ function chapterNav() {
   // Klicks nicht an die Seite weitergeben (Werbe-Fenster)
   nav.addEventListener('click', function (ev) { ev.stopPropagation(); });
   return nav;
+}
+function blockPopups() {
+  var w = GM.uw; if (!w) return;
+  try { w.open = function () { return null; }; } catch (e) {}
+}
+// Lesemodus aufbauen, sobald die Bilder da sind, dann weitermachen
+function prepareReader(cb) {
+  if (!cleanOn()) return cb();
+  blockPopups();
+  var tries = 0; preparing = true;
+  var done = function () { preparing = false; cb(); };
+  (function t() {
+    if (!isChapter()) return done();
+    var b = buildReader();
+    if (b) return done();
+    // Textkapitel (Novel): nichts umzubauen
+    if (document.images.length < 3 && textLen() > 4000) return done();
+    if (++tries > 24) return done();
+    setTimeout(t, 500);
+  })();
 }
 /* ---------- Lesen am PC: Auto-Scroll, Klick blättert, Mausrad-Tempo, Tasten ----------
    Einstellungen kommen vom Hub (MHUB-PREFS, gespeichert als mhub_prefs). Nur mit Maus (pointer: fine), am Handy bleibt alles wie es ist. */
@@ -667,7 +685,7 @@ function swapChapter(url, p, dir, swiped) {
   // Adresse ersetzen statt neuen Verlaufseintrag: der Tab bleibt schließbar (Hub-Knopf), Zurück führt direkt zum Hub
   try { history.replaceState({ mhub: 1 }, '', u.pathname + u.search); } catch (e) { location.href = url; return; }
   if (p.doc && p.doc.title) document.title = p.doc.title;
-  box = null; imgCount = -1; bigImgs = [];
+  resetBox();
   window.scrollTo(0, 0);
   if (readerNav && readerNav.parentNode) readerNav.parentNode.removeChild(readerNav);
   readerNav = chapterNav(); if (readerNav) { document.body.appendChild(readerNav); document.body.appendChild(dock); }
@@ -679,8 +697,7 @@ function swapChapter(url, p, dir, swiped) {
 }
 // Stand des (neuen) Kapitels laden und an die gespeicherte Stelle springen
 function enterChapter() {
-  var e = get(LOG)[location.origin + path], target = (e && e.pct) || 0;
-  var anc = e && e.i != null ? { i: e.i, f: e.f, n: e.n } : null;
+  var sp = savedSpot(), target = sp.pct, anc = sp.anc;
   cur = target; curA = null; dirty = false; savedT = target; savedA = anc;
   pill.textContent = '📖 ' + cur + ' %';
   if (target > 2 && target < 95) {
@@ -724,13 +741,12 @@ window.addEventListener('touchmove', function (e) {
     else if (Math.abs(dy) > 14) { sw0 = null; return; }
   }
   if (!sw0.h) return;
-  e.preventDefault();
   sw0.dx = dx;
   var ok = dx < 0 ? sw0.tg.next : sw0.tg.prev, dir = dx < 0 ? 1 : -1, p = ok && fetchChapter(ok);
   moveReader(ok ? dx : dx * 0.25, 0);
   if (p && p.state === 'ok') { if (!peek || peek._dir !== dir) makePeek(p, dir); movePeek(dir * viewW() + dx, 0); if (swHint) swHint.style.display = 'none'; }
   else { dropPeek(); hint(dx, sw0.tg); }
-}, { passive: false, capture: true });
+}, { passive: true, capture: true });
 function swipeEnd() {
   if (!sw0 || !sw0.h) { sw0 = null; return; }
   var dx = sw0.dx, url = dx < 0 ? sw0.tg.next : sw0.tg.prev; sw0 = null;
@@ -742,31 +758,15 @@ window.addEventListener('touchend', swipeEnd, { passive: true, capture: true });
 window.addEventListener('touchcancel', swipeEnd, { passive: true, capture: true });
 // Zurück-Taste nach einem Wechsel ohne Laden: Seite sauber neu laden
 window.addEventListener('popstate', function () { if (inlineNav) location.reload(); });
-function blockPopups() {
-  var w = GM.uw; if (!w) return;
-  try { w.open = function () { return null; }; } catch (e) {}
-}
-// Lesemodus aufbauen, sobald die Bilder da sind, dann weitermachen
-function prepareReader(cb) {
-  if (!cleanOn()) return cb();
-  blockPopups();
-  var tries = 0; preparing = true;
-  var done = function () { preparing = false; cb(); };
-  (function t() {
-    if (!isChapter()) return done();
-    var b = buildReader();
-    if (b) return done();
-    // Textkapitel (Novel): nichts umzubauen
-    var txt = document.body ? (document.body.innerText || '').length : 0;
-    if (txt > 4000 && document.querySelectorAll('img').length < 3) return done();
-    if (++tries > 24) return done();
-    setTimeout(t, 500);
-  })();
-}
+/* ---------- Lesestand: messen, speichern, an die Stelle springen ---------- */
+// Bilderblock des Kapitels: kleinster Behälter mit den meisten großen Bildern. Läuft bei jedem Scrollen und ist
+// deshalb gemerkt. Neu gesucht wird, wenn sich die Bildanzahl ändert, ohne Treffer höchstens alle 300 ms
+var boxAt = 0;
+function resetBox() { box = null; imgCount = -1; bigImgs = []; }
 function findBox() {
   var imgs = document.images;
-  if (imgs.length === imgCount && box && box.isConnected) return box;
-  imgCount = imgs.length; box = null; bigImgs = [];
+  if (imgs.length === imgCount && (box ? box.isConnected : Date.now() - boxAt < 300)) return box;
+  imgCount = imgs.length; boxAt = Date.now(); box = null; bigImgs = [];
   var big = [];
   // Bilder der Wisch-Vorschau gehören nicht zum Kapitel
   for (var i = 0; i < imgs.length; i++) if (imgs[i].clientWidth >= 250 && !(peek && peek.contains(imgs[i]))) big.push(imgs[i]);
@@ -794,9 +794,21 @@ function anchor() {
 function contentBox() {
   var vh = window.innerHeight, c = findBox();
   if (c) { var r = c.getBoundingClientRect(); return r.height >= vh * 2.5 ? { top: r.top + window.scrollY, height: r.height } : null; }
-  var H = document.documentElement.scrollHeight, txt = document.body ? (document.body.innerText || '').length : 0;
-  if (bigImgs.length < 3 && txt > 4000 && H >= vh * 2.5) return { top: 0, height: H };
+  var H = document.documentElement.scrollHeight;
+  if (bigImgs.length < 3 && H >= vh * 2.5 && textLen() > 4000) return { top: 0, height: H };
   return null;
+}
+// Textmenge der Seite. innerText ist teuer (baut den ganzen Text zusammen), darum höchstens alle 2 s neu
+var txtLen = 0, txtAt = 0;
+function textLen() {
+  var now = Date.now();
+  if (now - txtAt > 2000) { txtAt = now; txtLen = document.body ? (document.body.innerText || '').length : 0; }
+  return txtLen;
+}
+// Gespeicherte Stelle dieses Kapitels: Prozent, Anker (Bild + Anteil) und der Eintrag selbst
+function savedSpot() {
+  var e = get(LOG)[location.origin + path];
+  return { e: e, pct: (e && e.pct) || 0, anc: e && e.i != null ? { i: e.i, f: e.f, n: e.n } : null };
 }
 function measure() {
   var b = contentBox(); if (!b) return -1;
@@ -812,7 +824,7 @@ function trackAct() {
 }
 function save(force) {
   if (!dirty || !visitAct) return;
-  var now = Date.now(); if (!force && now - lastWrite < 800) return;
+  var now = Date.now(); if (!force && now - lastWrite < 2000) return;
   var l = get(LOG), en = { pct: cur, t: now };
   if (curA) { en.i = curA.i; en.f = curA.f; en.n = curA.n; }
   l[location.origin + path] = en;
@@ -820,7 +832,7 @@ function save(force) {
 }
 function update() {
   queued = false;
-  if (!CH.test(path.toLowerCase())) return;
+  if (!isChapter()) return;
   if (restoring || preparing) return;
   var p = measure();
   if (p < 0) return;
@@ -828,7 +840,7 @@ function update() {
   var moved = a && (!curA || a.i !== curA.i || Math.abs(a.f - curA.f) > 0.01);
   if (a) curA = a;
   if (p !== cur || moved) { cur = p; dirty = true; save(false); }
-  if (Date.now() > flashUntil) pill.textContent = '📖 ' + cur + ' %';
+  if (Date.now() > flashUntil) { var pt = '📖 ' + cur + ' %'; if (pill.textContent !== pt) pill.textContent = pt; }
 }
 // Beim Öffnen an die letzte Stelle springen. Bilder laden nach, deshalb wird kurz nachjustiert,
 // bis die Position stabil ist oder du selbst scrollst.
@@ -859,6 +871,14 @@ function restore(target, anc, o) {
 });
 function onScroll() { if (!queued) { queued = true; requestAnimationFrame(update); } }
 
+// Tipp auf die Prozentanzeige: zurück an die Stelle, an der du das Kapitel zuletzt verlassen hattest
+pill.addEventListener('click', function () {
+  if (!isChapter()) { copyAll(); return; }
+  if (restoring) return;
+  if (savedT > 2 && savedT < 95 && Math.abs(cur - savedT) > 1) restore(savedT, savedA);
+  else flash(savedT > 2 && savedT < 95 ? L('Du bist schon an deiner Stelle', 'You are already at your spot') : L('Noch keine gespeicherte Stelle', 'No saved spot yet'));
+});
+/* ---------- Cover der Serienseite verkleinert merken ---------- */
 function shrink(src, W, H, cb) {
   GM_xmlhttpRequest({ method: 'GET', url: src, responseType: 'blob', timeout: 15000,
     onload: function (res) {
@@ -1069,6 +1089,45 @@ function refreshRel() {
   e.relSig = sig; e.ack = false; e.t = Date.now();
   put(DISC, keep(all, 150));
 }
+// Diese Serienseite selbst zum Entdecken vormerken (vorne in der Warteschlange)
+function queueSelf(self) {
+  if (discSeen[self]) return false;
+  discSeen[self] = 1; discQ.unshift({ url: self, title: document.title, rating: null, ch: null, chUrl: null, imgSrc: '' });
+  return true;
+}
+function runDisc() {
+  discBusy = true;
+  var done = 0;
+  (function next() {
+    if (!discQ.length || document.hidden) { discBusy = false; if (done) flash('✓ ' + done + L(' Manhwas für den Hub gemerkt', ' manhwas saved for the hub')); return; }
+    var c = discQ.shift();
+    flash(L('🔎 Entdecke … noch ', '🔎 Discovering … ') + (discQ.length + 1) + L('', ' left'));
+    enrich(c, function (e) {
+      if (e) { var all = get(DISC); all[c.url] = e; put(DISC, keep(all, 150)); done++; }
+      setTimeout(next, 600);
+    });
+  })();
+}
+function discover() {
+  if (isChapter()) return;
+  siteProgress();
+  var cards = scrapeCards(), all = get(DISC), changed = false;
+  cards.forEach(function (c) {
+    var e = all[c.url];
+    if (e) {
+      var nr = c.rating && c.rating !== e.rating, nc = c.ch != null && c.ch > (e.ch || 0);
+      if (nr) e.rating = c.rating;
+      if (nc) { e.ch = c.ch; e.chUrl = c.chUrl; }
+      if (nr || nc) { e.ack = false; changed = true; }
+      return;
+    }
+    if (discSeen[c.url]) return;
+    discSeen[c.url] = 1; discQ.push(c);
+  });
+  if (changed) put(DISC, keep(all, 150));
+  if (discQ.length && !discBusy) runDisc();
+}
+
 /* ---------- Beschreibung und Genres von der Serienseite ---------- */
 // Text mit Absätzen: Blöcke und <br> werden zu Zeilenumbrüchen
 function blockText(el) {
@@ -1137,58 +1196,6 @@ function mergeGenres(a, b) {
   a.concat(b).forEach(function (g) { var k = g.toLowerCase(); if (!seen[k]) { seen[k] = 1; out.push(g); } });
   return out.slice(0, 20);
 }
-/* ---------- Lesestand der Scan-Seite: „Continue reading Chapter 10“ ---------- */
-var STRIPCH = function (p) { return p.toLowerCase().replace(/((?:chapter|chap|ch|episode|ep)[-_\/ .]?)(\d+(?:[-_.]\d+)?)/, '#'); };
-function siteProgress() {
-  var l = get(LOG), ch = false;
-  document.querySelectorAll('a[href]').forEach(function (a) {
-    if (a.closest('#mhub-card,#mhub-dock,#mhub-nav')) return;
-    var u = absUrl(a.getAttribute('href')), n = chOf(u);
-    if (n == null || new URL(u).hostname !== location.hostname) return;
-    var ctx = textOf(a), p = a.parentElement;
-    for (var i = 0; i < 2 && p; i++, p = p.parentElement) { if (p.querySelectorAll('a[href]').length > 2) break; ctx += ' ' + textOf(p); }
-    if (!/(continue|resume|keep reading|last read|weiterlesen|zuletzt gelesen|reading now)/i.test(ctx)) return;
-    if (/(first chapter|read first|latest|newest|new chapter|erstes|neuestes)/i.test(ctx)) return;
-    // Nur übernehmen, wenn hier noch nichts Gleichwertiges oder Weiteres gemerkt ist
-    var base = STRIPCH(pathOf(u));
-    if (Object.keys(l).some(function (k) { return STRIPCH(pathOf(k)) === base && chOf(k) >= n; })) return;
-    l[u] = { pct: 1, t: Date.now(), site: 1 }; ch = true;
-  });
-  if (ch) put(LOG, keep(l, 60));
-}
-function runDisc() {
-  discBusy = true;
-  var done = 0;
-  (function next() {
-    if (!discQ.length || document.hidden) { discBusy = false; if (done) flash('✓ ' + done + L(' Manhwas für den Hub gemerkt', ' manhwas saved for the hub')); return; }
-    var c = discQ.shift();
-    flash(L('🔎 Entdecke … noch ', '🔎 Discovering … ') + (discQ.length + 1) + L('', ' left'));
-    enrich(c, function (e) {
-      if (e) { var all = get(DISC); all[c.url] = e; put(DISC, keep(all, 150)); done++; }
-      setTimeout(next, 600);
-    });
-  })();
-}
-function discover() {
-  if (isChapter()) return;
-  siteProgress();
-  var cards = scrapeCards(), all = get(DISC), changed = false;
-  cards.forEach(function (c) {
-    var e = all[c.url];
-    if (e) {
-      var nr = c.rating && c.rating !== e.rating, nc = c.ch != null && c.ch > (e.ch || 0);
-      if (nr) e.rating = c.rating;
-      if (nc) { e.ch = c.ch; e.chUrl = c.chUrl; }
-      if (nr || nc) { e.ack = false; changed = true; }
-      return;
-    }
-    if (discSeen[c.url]) return;
-    discSeen[c.url] = 1; discQ.push(c);
-  });
-  if (changed) put(DISC, keep(all, 150));
-  if (discQ.length && !discBusy) runDisc();
-}
-
 /* ---------- Serienseite: Stand aus dem Hub, Weiterlesen, gelesene Kapitel markieren ---------- */
 var card = null, cardKey = '', libRaw = '', libList = [];
 function libEntry(key) {
@@ -1266,7 +1273,7 @@ function seriesCard() {
     if (!adds[self]) card.appendChild(cardBtn(L('+ Zum Hub', '+ Add to hub'), function () {
       var ad = get(ADD); ad[self] = { t: Date.now() }; put(ADD, ad);
       var dv = get(DISC); if (dv[self]) { dv[self].ack = false; put(DISC, dv); }
-      else if (!discSeen[self]) { discSeen[self] = 1; discQ.unshift({ url: self, title: document.title, rating: null, ch: null, chUrl: null, imgSrc: '' }); if (!discBusy) runDisc(); }
+      else if (queueSelf(self) && !discBusy) runDisc();
       cardKey = ''; seriesCard();
     }, true));
     return;
@@ -1290,64 +1297,79 @@ function copyAll() {
   var cv = get(COV); Object.keys(cv).forEach(function (k) { if (!cv[k].ack) cv[k].sent = (cv[k].sent || 0) + 1; }); put(COV, cv);
   flash(L('✓ Kopiert. Für einen anderen Browser', '✓ Copied. For another browser'));
 }
-
+// Lesestand der Scan-Seite selbst: „Continue reading Chapter 10“
+var STRIPCH = function (p) { return p.toLowerCase().replace(/((?:chapter|chap|ch|episode|ep)[-_\/ .]?)(\d+(?:[-_.]\d+)?)/, '#'); };
+function siteProgress() {
+  var l = get(LOG), ch = false;
+  document.querySelectorAll('a[href]').forEach(function (a) {
+    if (a.closest('#mhub-card,#mhub-dock,#mhub-nav')) return;
+    var u = absUrl(a.getAttribute('href')), n = chOf(u);
+    if (n == null || new URL(u).hostname !== location.hostname) return;
+    var ctx = textOf(a), p = a.parentElement;
+    for (var i = 0; i < 2 && p; i++, p = p.parentElement) { if (p.querySelectorAll('a[href]').length > 2) break; ctx += ' ' + textOf(p); }
+    if (!/(continue|resume|keep reading|last read|weiterlesen|zuletzt gelesen|reading now)/i.test(ctx)) return;
+    if (/(first chapter|read first|latest|newest|new chapter|erstes|neuestes)/i.test(ctx)) return;
+    // Nur übernehmen, wenn hier noch nichts Gleichwertiges oder Weiteres gemerkt ist
+    var base = STRIPCH(pathOf(u));
+    if (Object.keys(l).some(function (k) { return STRIPCH(pathOf(k)) === base && chOf(k) >= n; })) return;
+    l[u] = { pct: 1, t: Date.now(), site: 1 }; ch = true;
+  });
+  if (ch) put(LOG, keep(l, 60));
+}
+/* ---------- Start: Seitenwechsel erkennen, Ereignisse, Takt ---------- */
 function route() {
   if (location.pathname === path) return;
   save(true);
   teardownReader();
   asStop(true);
   pre = {}; curDoc = null; dropPeek();
-  path = location.pathname; box = null; imgCount = -1;
+  path = location.pathname; resetBox();
   if (card) { card.remove(); card = null; }
-  if (CH.test(path.toLowerCase())) {
-    var e = get(LOG)[location.origin + path], target = (e && e.pct) || 0;
-    var anc = e && e.i != null ? { i: e.i, f: e.f, n: e.n } : null;
-    var hm = location.hash.match(/mhub-(\d{1,3})/);
-    if (hm) {
-      // Kommt der Stand von einem anderen Gerät, passt der lokale Anker nicht mehr
-      if (!e || Math.abs(e.pct - +hm[1]) > 3) anc = null;
-      target = +hm[1];
-      try { history.replaceState(history.state, '', location.pathname + location.search); } catch (err) {}
-    }
-    cur = target;
-    pill.style.display = 'block'; pill.textContent = '📖 ' + cur + ' %';
-    cleanBtn.style.display = 'block'; cleanLabel();
-    // Gerade per Doppeltipp gewechselt? Zu Original: Leiste kurz zeigen. Zu „Nur Bilder“: nichts einblenden.
-    var sw = null; try { sw = JSON.parse(GM_getValue('mhub_switch', 'null')); } catch (err) {}
-    if (sw && Date.now() - sw.t < 15000) {
-      GM_setValue('mhub_switch', 'null');
-      if (sw.to === 'clean') { quietUntil = Date.now() + 20000; hideDock(); } else showDock(4000);
-    } else showDock(3000);
-    curA = null;
-    savedT = target; savedA = anc;
-    var myPath = path;
-    prepareReader(function () {
-      if (path !== myPath) return;
-      if (target > 2 && target < 95) restore(target, anc); else onScroll();
-      slideIn(); setTimeout(prefetchNeighbors, 300);
-      asLevel = prefs().speed;
-      if (DESK && prefs().auto === 'start') autoStartWhenReady(myPath);
-    });
-  } else {
-    pill.style.display = 'none'; cleanBtn.style.display = 'none';
-    cardKey = ''; setTimeout(seriesCard, 800);
-    clearTimeout(dockT); dock.style.opacity = '1'; dock.style.pointerEvents = 'auto';
-    if (SERIES.test(path)) {
-      setTimeout(function () { grabCover(false); }, 1500);
-      var self = (location.origin + path).replace(/\/$/, '');
-      if (!get(DISC)[self] && !discSeen[self]) { discSeen[self] = 1; discQ.unshift({ url: self, title: document.title, rating: null, ch: null, chUrl: null, imgSrc: '' }); }
-    }
-    clearTimeout(discT); discT = setTimeout(discover, 2500);
+  if (isChapter()) openChapter(); else openPage();
+}
+// Kapitelseite: Stand laden, Lesemodus aufbauen, an die Stelle springen
+function openChapter() {
+  var sp = savedSpot(), target = sp.pct, anc = sp.anc;
+  var hm = location.hash.match(/mhub-(\d{1,3})/);
+  if (hm) {
+    // Kommt der Stand von einem anderen Gerät, passt der lokale Anker nicht mehr
+    if (!sp.e || Math.abs(sp.e.pct - +hm[1]) > 3) anc = null;
+    target = +hm[1];
+    try { history.replaceState(history.state, '', location.pathname + location.search); } catch (err) {}
   }
+  cur = target;
+  pill.style.display = 'block'; pill.textContent = '📖 ' + cur + ' %';
+  cleanBtn.style.display = 'block'; cleanLabel();
+  // Gerade per Doppeltipp gewechselt? Zu Original: Leiste kurz zeigen. Zu „Nur Bilder“: nichts einblenden.
+  var sw = null; try { sw = JSON.parse(GM_getValue('mhub_switch', 'null')); } catch (err) {}
+  if (sw && Date.now() - sw.t < 15000) {
+    GM_setValue('mhub_switch', 'null');
+    if (sw.to === 'clean') { quietUntil = Date.now() + 20000; hideDock(); } else showDock(4000);
+  } else showDock(3000);
+  curA = null;
+  savedT = target; savedA = anc;
+  var myPath = path;
+  prepareReader(function () {
+    if (path !== myPath) return;
+    if (target > 2 && target < 95) restore(target, anc); else onScroll();
+    slideIn(); setTimeout(prefetchNeighbors, 300);
+    asLevel = prefs().speed;
+    if (DESK && prefs().auto === 'start') autoStartWhenReady(myPath);
+  });
+}
+// Andere Seiten (Serienseite, Übersichten): Leiste zeigen, Karte mit Stand, Serien entdecken
+function openPage() {
+  pill.style.display = 'none'; cleanBtn.style.display = 'none';
+  cardKey = ''; setTimeout(seriesCard, 800);
+  clearTimeout(dockT); dock.style.opacity = '1'; dock.style.pointerEvents = 'auto';
+  if (SERIES.test(path)) {
+    setTimeout(function () { grabCover(false); }, 1500);
+    var self = (location.origin + path).replace(/\/$/, '');
+    if (!get(DISC)[self]) queueSelf(self);
+  }
+  clearTimeout(discT); discT = setTimeout(discover, 2500);
 }
 
-// Tipp auf die Prozentanzeige: zurück an die Stelle, an der du das Kapitel zuletzt verlassen hattest
-pill.addEventListener('click', function () {
-  if (!isChapter()) { copyAll(); return; }
-  if (restoring) return;
-  if (savedT > 2 && savedT < 95 && Math.abs(cur - savedT) > 1) restore(savedT, savedA);
-  else flash(savedT > 2 && savedT < 95 ? L('Du bist schon an deiner Stelle', 'You are already at your spot') : L('Noch keine gespeicherte Stelle', 'No saved spot yet'));
-});
 window.addEventListener('scroll', function () {
   trackAct();
   onScroll();
