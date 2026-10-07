@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.22.0
+// @version      3.24.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.22.0';
+var VERSION = '3.24.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -117,6 +117,7 @@ if (isHub || topMode) {
     if (d === 'MHUB-HELLO') send();
     else if (d.indexOf('MHUB-LANG:') === 0) GM_setValue('mhub_lang', d.slice(10) === 'en' ? 'en' : 'de');
     else if (d.indexOf('MHUB-PREFS:') === 0) GM_setValue('mhub_prefs', d.slice(11));
+    else if (d === 'MHUB-RELOAD' && topMode) location.reload();
     else if (d.indexOf('MHUB-SITES:') === 0) {
       try { var list = JSON.parse(d.slice(11)); if (Array.isArray(list)) GM_setValue('mhub_sites', JSON.stringify(list)); } catch (err) {}
       post('MHUB-SITES-OK');
@@ -532,8 +533,12 @@ function prefetchNeighbors() {
     pre[u] = { state: 'loading' };
     fetch(u, { credentials: 'include' }).then(function (r) { return r.ok ? r.text() : ''; }).then(function (html) {
       var doc = html ? new DOMParser().parseFromString(html, 'text/html') : null, imgs = html ? imgsFromHtml(html, doc) : [];
-      pre[u] = { state: imgs.length >= 3 ? 'ok' : 'none', imgs: imgs, doc: doc };
-      if (prefs().preload) imgs.slice(0, 3).forEach(function (src) { var i = new Image(); i.decoding = 'async'; i.src = src; });
+      // Gespeicherte Stelle in diesem Kapitel? Dann die Bilder dort vorladen statt am Anfang
+      var le = get(LOG)[u.replace(/[#?].*$/, '')], anc = null;
+      if (le && le.pct > 2 && le.pct < 95 && le.i != null && imgs.length && Math.abs((le.n || 0) - imgs.length) <= Math.max(2, imgs.length * 0.1)) anc = { i: Math.min(le.i, imgs.length - 1), f: le.f || 0 };
+      pre[u] = { state: imgs.length >= 3 ? 'ok' : 'none', imgs: imgs, doc: doc, anc: anc };
+      var from = anc ? Math.max(0, anc.i - 1) : 0;
+      if (prefs().preload) imgs.slice(from, from + 4).forEach(function (src) { var i = new Image(); i.decoding = 'async'; i.src = src; });
     }).catch(function () { pre[u] = { state: 'none' }; });
   });
 }
@@ -549,9 +554,30 @@ function makePeek(p, dir) {
   dropPeek();
   var d = document.createElement('div'); d.id = 'mhub-peek'; d._dir = dir;
   d.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100vh;overflow:hidden;z-index:2147483640;background:#0b0a10;pointer-events:none;will-change:transform;transform:translateX(' + (dir * viewW()) + 'px)';
-  p.imgs.slice(0, 3).forEach(function (src) { var i = new Image(); i.src = src; i.alt = ''; i.style.cssText = 'display:block;width:100%;max-width:820px;height:auto;margin:0 auto'; d.appendChild(i); });
+  var a = p.anc, from = a ? Math.max(0, a.i - 1) : 0, inner = document.createElement('div'), els = [];
+  inner.style.cssText = 'position:absolute;left:0;right:0;top:0';
+  p.imgs.slice(from, from + 4).forEach(function (src) { var i = new Image(); i.src = src; i.alt = ''; i.style.cssText = 'display:block;width:100%;max-width:820px;height:auto;margin:0 auto'; inner.appendChild(i); els.push(i); });
+  d.appendChild(inner);
   document.body.appendChild(d);
+  // Wie restore(): Bild a.i, Anteil a.f liegt auf der Linie bei 30 % der Bildschirmhöhe
+  if (a) {
+    var lay = function () {
+      var y = 0;
+      for (var k = 0; k < els.length; k++) {
+        if (!els[k].complete || !els[k].naturalWidth) return;
+        if (from + k < a.i) y += els[k].offsetHeight; else { y += a.f * els[k].offsetHeight; break; }
+      }
+      inner.style.transform = 'translateY(' + Math.round(window.innerHeight * REF - y) + 'px)';
+    };
+    els.forEach(function (im) { im.addEventListener('load', lay); }); lay();
+  }
   return (peek = d);
+}
+// Vorschau ausblenden, wenn die echte Seite darunter an derselben Stelle steht
+function fadePeek() {
+  var pk = peek; peek = null; if (!pk) return;
+  pk.style.transition = 'opacity .15s'; pk.style.opacity = '0';
+  setTimeout(function () { if (pk.parentNode) pk.parentNode.removeChild(pk); }, 180);
 }
 function dropPeek() { if (peek && peek.parentNode) peek.parentNode.removeChild(peek); peek = null; }
 function movePeek(x, ms) { if (!peek) return; peek.style.transition = ms ? 'transform ' + ms + 'ms ease-out' : 'none'; peek.style.transform = 'translateX(' + x + 'px)'; }
@@ -578,7 +604,7 @@ function swapChapter(url, p, dir) {
   reader.innerHTML = ''; readerSrcs = {};
   p.imgs.forEach(function (src, k) {
     readerSrcs[src] = 1;
-    var n = document.createElement('img'); n.src = src; n.alt = ''; n.decoding = 'async'; if (k > 3) n.loading = 'lazy';
+    var n = document.createElement('img'); n.src = src; n.alt = ''; n.decoding = 'async'; if (k > (p.anc ? p.anc.i + 3 : 3)) n.loading = 'lazy';
     reader.appendChild(n);
   });
   // Erst den eigenen Pfad setzen, dann die Adresse: so baut route() nichts neu auf
@@ -589,10 +615,9 @@ function swapChapter(url, p, dir) {
   window.scrollTo(0, 0);
   if (readerNav && readerNav.parentNode) readerNav.parentNode.removeChild(readerNav);
   readerNav = chapterNav(); if (readerNav) { document.body.appendChild(readerNav); document.body.appendChild(dock); }
-  enterChapter();
-  // Die Vorschau zeigt schon genau diesen Anfang: Leser ohne Animation zurück an seinen Platz, dann Vorschau weg
   moveReader(0, 0);
-  requestAnimationFrame(function () { requestAnimationFrame(dropPeek); });
+  // Die Vorschau zeigt schon genau diese Stelle und bleibt liegen, bis die Seite darunter dort steht
+  enterChapter();
   pre = {};
   setTimeout(prefetchNeighbors, 1200);
 }
@@ -602,8 +627,10 @@ function enterChapter() {
   var anc = e && e.i != null ? { i: e.i, f: e.f, n: e.n } : null;
   cur = target; curA = null; dirty = false; savedT = target; savedA = anc;
   pill.textContent = '📖 ' + cur + ' %';
-  if (target > 2 && target < 95) { fadeCover(true); restore(target, anc, { quiet: true, fast: true, done: function () { fadeCover(false); } }); }
-  else onScroll();
+  if (target > 2 && target < 95) {
+    if (peek) { var pk = peek; setTimeout(function () { if (peek === pk) fadePeek(); }, 3000); restore(target, anc, { quiet: true, fast: true, done: fadePeek }); }
+    else { fadeCover(true); restore(target, anc, { quiet: true, fast: true, done: function () { fadeCover(false); } }); }
+  } else { onScroll(); requestAnimationFrame(function () { requestAnimationFrame(fadePeek); }); }
 }
 // Nach einem normalen Wechsel per Wischen: neues Kapitel von der Seite hereingleiten lassen
 function slideIn() {
@@ -684,7 +711,8 @@ function findBox() {
   if (imgs.length === imgCount && box && box.isConnected) return box;
   imgCount = imgs.length; box = null; bigImgs = [];
   var big = [];
-  for (var i = 0; i < imgs.length; i++) if (imgs[i].clientWidth >= 250) big.push(imgs[i]);
+  // Bilder der Wisch-Vorschau gehören nicht zum Kapitel
+  for (var i = 0; i < imgs.length; i++) if (imgs[i].clientWidth >= 250 && !(peek && peek.contains(imgs[i]))) big.push(imgs[i]);
   if (big.length < 3) return null;
   var need = Math.max(3, Math.floor(big.length * 0.8)), el = big[0].parentElement;
   while (el && el !== document.body) {
