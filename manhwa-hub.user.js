@@ -1,0 +1,661 @@
+// ==UserScript==
+// @name         Manhwa Hub
+// @namespace    manhwa-hub
+// @version      3.13.0
+// @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
+// @homepageURL  https://github.com/de-joneh/manhwa-hub
+// @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
+// @downloadURL  https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
+// @match        *://*/*
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_setClipboard
+// @grant        GM_xmlhttpRequest
+// @grant        GM_registerMenuCommand
+// @grant        GM_addValueChangeListener
+// @grant        unsafeWindow
+// @connect      *
+// @run-at       document-idle
+// ==/UserScript==
+(function (GM) {
+var isHub = !!document.querySelector('[data-mhub]');
+'use strict';
+var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
+    GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
+    GM_addValueChangeListener = GM.GM_addValueChangeListener;
+var VERSION = '3.13.0';
+var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
+var SITES = ['asura', 'thunder'];
+var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
+var SERIES = /\/(?:series|manga|manhwa|manhua|comics?|title|webtoon|novels?)\/[^\/]+\/?$/;
+var LOG = 'mhub_log', COV = 'mhub_cov', DISC = 'mhub_disc';
+
+function get(k) { try { return JSON.parse(GM_getValue(k, '{}')) || {}; } catch (e) { return {}; } }
+function put(k, v) { GM_setValue(k, JSON.stringify(v)); }
+function keep(o, n) {
+  var ks = Object.keys(o).sort(function (a, b) { return o[b].t - o[a].t; }).slice(0, n), r = {};
+  ks.forEach(function (k) { r[k] = o[k]; }); return r;
+}
+// Der Hub läuft in einem eingebetteten Rahmen. Läuft das Skript dort nicht, übernimmt es die Claude-Seite
+// außen herum und spricht den Rahmen per Nachricht an.
+var topMode = !isHub && window.top === window.self && /(^|\.)claude\.ai$/.test(location.hostname);
+var hubWin = isHub ? window : null;
+function post(m) { if (hubWin) { try { hubWin.postMessage(m, '*'); } catch (e) {} } }
+function token(forClipboard) {
+  var l = get(LOG), cv = get(COV);
+  var p = Object.keys(l).map(function (k) { return { url: k, pct: l[k].pct, t: l[k].t }; });
+  var c = Object.keys(cv).filter(function (k) { return !cv[k].ack && (!forClipboard || (cv[k].sent || 0) < 2); })
+    .map(function (k) { return { url: k, img: cv[k].img, title: cv[k].title }; });
+  var dd = get(DISC), d = Object.keys(dd).filter(function (k) { return !dd[k].ack; }).slice(0, forClipboard ? 30 : 150)
+    .map(function (k) { var e = dd[k]; return { url: k, title: e.title, rating: e.rating, ch: e.ch, chUrl: e.chUrl, img: e.img, site: e.site, g: e.g, desc: e.desc, type: e.type, rel: e.rel }; });
+  if (!p.length && !c.length && !d.length) return '';
+  return 'MHUB2:' + btoa(unescape(encodeURIComponent(JSON.stringify({ p: p, c: c, d: d }))));
+}
+
+/* ---------- Im Hub ---------- */
+if (isHub || topMode) {
+  var send = function () { var t = token(false); if (t) post(t); };
+  var checking = false;
+  var escRe = function (s) { return s.replace(/[.*+?^$(){}|[\]\\]/g, '\\$&'); };
+  var pattern = function (tpl) {
+    var path = tpl.replace(/^https?:\/\/[^\/]+/, ''), origin = tpl.slice(0, tpl.length - path.length);
+    var parts = path.split('{n}');
+    var rx = escRe(parts[0]).replace(/-([a-z0-9]{8})\//, function (m, g) { return /\d/.test(g) ? '-[a-z0-9]{8}/' : m; });
+    return { re: new RegExp(rx + '(\\d+(?:[.-]\\d+)?)(?!\\d)', 'gi'), origin: origin, after: parts[1] || '' };
+  };
+  var seriesPage = function (tpl) {
+    var m = tpl.match(/^(https?:\/\/[^\/]+\/(?:series|manga|manhwa|manhua|comics?|title|webtoon|novels?)\/[^\/]+)\//i);
+    return m ? m[1] : null;
+  };
+  var fetchText = function (url, cb) {
+    GM_xmlhttpRequest({ method: 'GET', url: url, timeout: 15000,
+      onload: function (r) { cb(r.status >= 200 && r.status < 300 ? String(r.responseText || '') : null); },
+      onerror: function () { cb(null); }, ontimeout: function () { cb(null); } });
+  };
+  var scan = function (text, pt) {
+    var best = null, m;
+    text = text.replace(/\\\//g, '/');
+    pt.re.lastIndex = 0;
+    while ((m = pt.re.exec(text))) {
+      var n = parseFloat(m[1].replace('-', '.'));
+      if (!isNaN(n) && n < 100000 && (!best || n > best.n)) best = { n: n, url: pt.origin + m[0] + pt.after };
+    }
+    return best;
+  };
+  var checkOne = function (j, cb) {
+    var pt = pattern(j.tpl), urls = [seriesPage(j.tpl), j.latest].filter(Boolean), i = 0;
+    (function step() {
+      if (i >= urls.length) return cb(null);
+      fetchText(urls[i++], function (t) {
+        var b = t ? scan(t, pt) : null;
+        if (b) return cb(b);
+        step();
+      });
+    })();
+  };
+  var runCheck = function (jobs) {
+    if (checking || !Array.isArray(jobs)) return;
+    checking = true;
+    var i = 0;
+    (function next() {
+      if (i >= jobs.length) { checking = false; post('MHUB-CHECKEND:' + JSON.stringify({ total: jobs.length })); return; }
+      var j = jobs[i++];
+      checkOne(j, function (b) {
+        post('MHUB-FOUND:' + JSON.stringify({ id: j.id, max: b ? b.n : null, url: b ? b.url : null, done: i, total: jobs.length }));
+        setTimeout(next, 900);
+      });
+    })();
+  };
+  window.addEventListener('message', function (e) {
+    if (typeof e.data !== 'string' || e.data.indexOf('MHUB') !== 0) return;
+    if (isHub ? e.origin !== location.origin : (!e.source || e.source === window)) return;
+    var d = e.data;
+    if (topMode && hubWin !== e.source) { hubWin = e.source; post('MHUB-CORE:' + VERSION); GM_setValue('mhub_home', location.origin + location.pathname); }
+    if (d === 'MHUB-HELLO') send();
+    else if (d.indexOf('MHUB-SITES:') === 0) {
+      try { var list = JSON.parse(d.slice(11)); if (Array.isArray(list)) GM_setValue('mhub_sites', JSON.stringify(list)); } catch (err) {}
+      post('MHUB-SITES-OK');
+    }
+    else if (d.indexOf('MHUB-ACK:') === 0) {
+      try {
+        var urls = JSON.parse(d.slice(9)), cv = get(COV), dv = get(DISC), ch = false, ch2 = false;
+        urls.forEach(function (u) {
+          if (cv[u] && !cv[u].ack) { cv[u].ack = true; ch = true; }
+          if (dv[u] && !dv[u].ack) { dv[u].ack = true; ch2 = true; }
+        });
+        if (ch) put(COV, cv);
+        if (ch2) put(DISC, dv);
+      } catch (err) {}
+    }
+    else if (d.indexOf('MHUB-CHECK:') === 0) { try { runCheck(JSON.parse(d.slice(11))); } catch (err) {} }
+    else if (d.indexOf('MHUB-IMG:') === 0) {
+      try { var o = JSON.parse(d.slice(9)); shrink(o.url, 360, 480, function (img) { post('MHUB-IMGOK:' + JSON.stringify({ id: o.id, img: img })); }); } catch (err) {}
+    }
+  });
+  if (GM_addValueChangeListener) {
+    GM_addValueChangeListener(LOG, function (n, o, v, remote) { if (remote) send(); });
+    GM_addValueChangeListener(COV, function (n, o, v, remote) { if (remote) send(); });
+    GM_addValueChangeListener(DISC, function (n, o, v, remote) { if (remote) send(); });
+  }
+  if (isHub) { post('MHUB-CORE:' + VERSION); send(); }
+  else {
+    // Alle Rahmen der Claude-Seite anpingen, bis sich der Hub meldet
+    var ping = function (w, depth) {
+      for (var i = 0; i < w.frames.length; i++) {
+        try { w.frames[i].postMessage('MHUB-PING', '*'); if (depth < 3) ping(w.frames[i], depth + 1); } catch (e) {}
+      }
+    };
+    var tries = 0, pt = setInterval(function () { if (hubWin || ++tries > 30) { clearInterval(pt); return; } ping(window, 0); }, 1500);
+    document.addEventListener('visibilitychange', function () { if (!document.hidden) { hubWin = null; tries = 0; ping(window, 0); } });
+  }
+  return;
+}
+
+/* ---------- Auf den Scan-Seiten ---------- */
+if (window.top !== window.self) return;
+try { SITES = SITES.concat(JSON.parse(GM_getValue('mhub_sites', '[]')) || []); } catch (e) {}
+if (!SITES.some(function (s) { return s && location.hostname.indexOf(s) > -1; })) return;
+var path = '', cur = 0, box = null, imgCount = -1, dirty = false, lastWrite = 0, flashUntil = 0, queued = false, restoring = false, touched = false;
+var bigImgs = [], curA = null, REF = 0.3;
+var savedT = 0, savedA = null;
+var hideT = 0, discT = 0, discQ = [], discBusy = false, discSeen = {};
+function isChapter() { return CH.test(path.toLowerCase()); }
+
+var dock = document.createElement('div');
+dock.style.cssText = 'position:fixed;right:8px;bottom:calc(8px + env(safe-area-inset-bottom, 0px));z-index:2147483647;transition:opacity .25s;display:flex;gap:6px;align-items:center;font:700 14px system-ui,sans-serif;user-select:none';
+var pill = document.createElement('div');
+pill.style.cssText = 'background:#913fe2;color:#fff;padding:9px 14px;border-radius:999px;box-shadow:0 3px 12px rgba(0,0,0,.45);display:none;cursor:pointer;white-space:nowrap';
+var homeBtn = document.createElement('div');
+homeBtn.setAttribute('role', 'button'); homeBtn.setAttribute('aria-label', 'Zurück zum Manhwa Hub');
+homeBtn.style.cssText = 'display:flex;align-items:center;gap:5px;background:#17121f;color:#fff;padding:9px 12px;border-radius:999px;box-shadow:0 3px 12px rgba(0,0,0,.45);cursor:pointer;border:1px solid #913fe2';
+homeBtn.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#ab6bf0" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11l9-7 9 7"/><path d="M5 10v10h14V10"/></svg><span>Hub</span>';
+homeBtn.addEventListener('click', function () {
+  save(true);
+  location.href = GM_getValue('mhub_home', '') || HUB_DEFAULT;
+});
+dock.id = 'mhub-dock';
+var cleanBtn = document.createElement('div');
+cleanBtn.setAttribute('role', 'button');
+cleanBtn.style.cssText = 'display:none;background:#17121f;color:#fff;padding:9px 11px;border-radius:999px;box-shadow:0 3px 12px rgba(0,0,0,.45);cursor:pointer;border:1px solid #3a3350;font-size:13px';
+function cleanLabel() { cleanBtn.textContent = cleanOn() ? 'Original' : 'Nur Bilder'; cleanBtn.setAttribute('aria-label', cleanOn() ? 'Originalseite anzeigen' : 'Nur die Bilder anzeigen'); }
+cleanBtn.addEventListener('click', function () {
+  save(true);
+  GM_setValue(CLEAN_KEY, cleanOn() ? '0' : '1');
+  location.reload();
+});
+dock.appendChild(pill); dock.appendChild(cleanBtn); dock.appendChild(homeBtn);
+// In Kapiteln ist die Leiste versteckt. Doppeltipp zeigt sie für 3 Sekunden.
+var dockT = 0;
+function showDock(ms) {
+  dock.style.opacity = '1'; dock.style.pointerEvents = 'auto';
+  clearTimeout(dockT);
+  if (isChapter()) dockT = setTimeout(hideDock, ms || 3000);
+}
+function hideDock() { if (!isChapter()) return; dock.style.opacity = '0'; dock.style.pointerEvents = 'none'; }
+var lastTap = 0, tapX = 0, tapY = 0, tapMoved = false;
+window.addEventListener('touchstart', function () { tapMoved = false; }, { passive: true, capture: true });
+window.addEventListener('touchmove', function () { tapMoved = true; }, { passive: true, capture: true });
+window.addEventListener('touchend', function (e) {
+  if (!isChapter() || tapMoved || e.touches.length || dock.contains(e.target)) return;
+  var t = e.changedTouches[0], now = Date.now();
+  if (now - lastTap < 350 && Math.abs(t.clientX - tapX) < 40 && Math.abs(t.clientY - tapY) < 40) { lastTap = 0; showDock(3000); }
+  else { lastTap = now; tapX = t.clientX; tapY = t.clientY; }
+}, { passive: true, capture: true });
+window.addEventListener('dblclick', function (e) { if (isChapter() && !dock.contains(e.target)) showDock(3000); }, true);
+dock.addEventListener('click', function () { if (isChapter()) showDock(3000); }, true);
+(document.body || document.documentElement).appendChild(dock);
+function flash(t) {
+  pill.textContent = t; pill.style.display = 'block'; flashUntil = Date.now() + 2500;
+  showDock(2800);
+  clearTimeout(hideT);
+  if (!isChapter()) hideT = setTimeout(function () { if (!isChapter()) pill.style.display = 'none'; }, 2600);
+}
+
+/* ---------- Lesemodus: nur die Bilder ---------- */
+var preparing = false, CLEAN_KEY = 'mhub_clean', reader = null, readerStyle = null, readerObs = null, readerSrcs = {};
+function cleanOn() { return GM_getValue(CLEAN_KEY, '1') === '1'; }
+// Größte verfügbare Bildversion: srcset, <picture>-Quellen und Next.js-Bildproxy (/_next/image?url=…)
+function pickSet(set) {
+  var best = '', bw = 0;
+  String(set || '').split(',').forEach(function (part) {
+    var m = part.trim().match(/^(\S+)(?:\s+(\d+(?:\.\d+)?)([wx]))?$/); if (!m) return;
+    var w = m[2] ? parseFloat(m[2]) * (m[3] === 'x' ? 1000 : 1) : 1;
+    if (w >= bw) { bw = w; best = m[1]; }
+  });
+  return best;
+}
+function unproxy(u) {
+  try {
+    var x = new URL(u, location.href);
+    if (/\/_next\/image/.test(x.pathname) && x.searchParams.get('url')) return new URL(x.searchParams.get('url'), location.href).href;
+    return x.href;
+  } catch (e) { return u; }
+}
+function bestSrc(im) {
+  var set = im.getAttribute('srcset') || im.getAttribute('data-srcset') || '';
+  var pic = im.parentElement && im.parentElement.tagName === 'PICTURE' ? im.parentElement : null;
+  if (pic) [].forEach.call(pic.querySelectorAll('source'), function (s) { set += ',' + (s.getAttribute('srcset') || s.getAttribute('data-srcset') || ''); });
+  var fromSet = pickSet(set.replace(/^,+/, ''));
+  var base = imgSrc(im);
+  var u = fromSet && !/^data:/.test(fromSet) ? fromSet : base;
+  return u ? unproxy(u) : '';
+}
+function imgSrc(im) {
+  var ds = im.getAttribute('data-src') || im.getAttribute('data-lazy-src') || im.getAttribute('data-original') || im.getAttribute('data-url') || '';
+  var s = im.currentSrc || im.getAttribute('src') || '';
+  if (ds && (!s || /^data:|blank|placeholder|loading|lazy/i.test(s))) s = ds;
+  try { return s ? new URL(s, location.href).href : ''; } catch (e) { return ''; }
+}
+function addReaderImgs(list) {
+  var added = 0;
+  list.forEach(function (im) {
+    var src = bestSrc(im); if (!src || /^data:/.test(src) || readerSrcs[src]) return;
+    readerSrcs[src] = 1;
+    var n = document.createElement('img');
+    n.src = src; n.alt = ''; n.decoding = 'async';
+    if (reader.children.length > 3) n.loading = 'lazy';
+    var w = +im.getAttribute('width'), hgt = +im.getAttribute('height');
+    if (w > 0 && hgt > 0) { n.width = w; n.height = hgt; }
+    reader.appendChild(n); added++;
+  });
+  return added;
+}
+function buildReader() {
+  if (reader) return true;
+  var c = findBox(); if (!c || bigImgs.length < 3) return false;
+  var src = c, srcImgs = bigImgs.slice();
+  reader = document.createElement('div'); reader.id = 'mhub-reader';
+  readerSrcs = {};
+  // Bilder ohne normale Adresse (z. B. auf Canvas gezeichnet): Lesemodus hier nicht möglich
+  if (addReaderImgs(srcImgs) < 3) { reader = null; return 'skip'; }
+  readerStyle = document.createElement('style');
+  readerStyle.textContent = 'html,body{background:#0b0a10!important;overflow-x:hidden!important;overflow-y:auto!important;margin:0!important}' +
+    'body>*:not(#mhub-reader):not(#mhub-dock){display:none!important}' +
+    '#mhub-reader{display:block!important;background:#0b0a10;padding:0 0 110px;margin:0;touch-action:manipulation}' +
+    '#mhub-reader img{display:block;width:100%;max-width:820px;height:auto;margin:0 auto;border:0}';
+  (document.head || document.documentElement).appendChild(readerStyle);
+  document.body.appendChild(reader);
+  if (dock.parentNode) document.body.appendChild(dock);
+  // Klicks im Leser nicht an die Seite durchreichen, damit dort keine Werbe-Fenster aufgehen
+  ['click', 'mousedown', 'mouseup', 'touchend', 'pointerup', 'auxclick'].forEach(function (ev) {
+    reader.addEventListener(ev, function (e) { e.stopPropagation(); }, true);
+  });
+  // Bilder, die die Seite später nachlädt, ebenfalls übernehmen
+  var pend = 0;
+  readerObs = new MutationObserver(function () {
+    clearTimeout(pend);
+    pend = setTimeout(function () {
+      if (!reader) return;
+      addReaderImgs([].slice.call(src.querySelectorAll('img')).filter(function (im) { var w = +im.getAttribute('width'); return !w || w >= 250; }));
+    }, 700);
+  });
+  readerObs.observe(src, { subtree: true, childList: true, attributes: true, attributeFilter: ['src', 'data-src', 'srcset'] });
+  box = null; imgCount = -1; bigImgs = [];
+  window.scrollTo(0, 0);
+  return true;
+}
+function teardownReader() {
+  if (readerObs) { readerObs.disconnect(); readerObs = null; }
+  if (reader && reader.parentNode) reader.parentNode.removeChild(reader);
+  if (readerStyle && readerStyle.parentNode) readerStyle.parentNode.removeChild(readerStyle);
+  reader = null; readerStyle = null; readerSrcs = {};
+}
+function blockPopups() {
+  var w = GM.uw; if (!w) return;
+  try { w.open = function () { return null; }; } catch (e) {}
+}
+// Lesemodus aufbauen, sobald die Bilder da sind, dann weitermachen
+function prepareReader(cb) {
+  if (!cleanOn()) return cb();
+  blockPopups();
+  var tries = 0; preparing = true;
+  var done = function () { preparing = false; cb(); };
+  (function t() {
+    if (!isChapter()) return done();
+    var b = buildReader();
+    if (b) return done();
+    // Textkapitel (Novel): nichts umzubauen
+    var txt = document.body ? (document.body.innerText || '').length : 0;
+    if (txt > 4000 && document.querySelectorAll('img').length < 3) return done();
+    if (++tries > 24) return done();
+    setTimeout(t, 500);
+  })();
+}
+function findBox() {
+  var imgs = document.images;
+  if (imgs.length === imgCount && box && box.isConnected) return box;
+  imgCount = imgs.length; box = null; bigImgs = [];
+  var big = [];
+  for (var i = 0; i < imgs.length; i++) if (imgs[i].clientWidth >= 250) big.push(imgs[i]);
+  if (big.length < 3) return null;
+  var need = Math.max(3, Math.floor(big.length * 0.8)), el = big[0].parentElement;
+  while (el && el !== document.body) {
+    var n = 0; for (var j = 0; j < big.length; j++) if (el.contains(big[j])) n++;
+    if (n >= need) break; el = el.parentElement;
+  }
+  box = el && el !== document.body ? el : null;
+  if (box) bigImgs = big.filter(function (b) { return box.contains(b); });
+  return box;
+}
+// Genauer Ankerpunkt: welches Bild liegt auf Höhe der oberen Bildschirmdrittel-Linie, und wie weit darin.
+// Das bleibt stabil, auch wenn andere Bilder noch nachladen und die Gesamthöhe sich ändert.
+function anchor() {
+  if (!findBox() || !bigImgs.length) return null;
+  var ref = window.innerHeight * REF, lo = 0, hi = bigImgs.length - 1;
+  while (lo < hi) { var mid = (lo + hi) >> 1; if (bigImgs[mid].getBoundingClientRect().bottom <= ref) lo = mid + 1; else hi = mid; }
+  var rc = bigImgs[lo].getBoundingClientRect();
+  var f = rc.height > 0 ? Math.max(0, Math.min(1, (ref - rc.top) / rc.height)) : 0;
+  return { i: lo, f: Math.round(f * 1000) / 1000, n: bigImgs.length };
+}
+// Bereich, über den der Fortschritt gemessen wird: der Bilderblock, bei Textkapiteln (Novels) die ganze Seite
+function contentBox() {
+  var vh = window.innerHeight, c = findBox();
+  if (c) { var r = c.getBoundingClientRect(); return r.height >= vh * 2.5 ? { top: r.top + window.scrollY, height: r.height } : null; }
+  var H = document.documentElement.scrollHeight, txt = document.body ? (document.body.innerText || '').length : 0;
+  if (bigImgs.length < 3 && txt > 4000 && H >= vh * 2.5) return { top: 0, height: H };
+  return null;
+}
+function measure() {
+  var b = contentBox(); if (!b) return -1;
+  var vh = window.innerHeight, y = window.scrollY;
+  return Math.max(0, Math.min(100, Math.round((y + vh - b.top) / b.height * 100)));
+}
+function save(force) {
+  if (!dirty) return;
+  var now = Date.now(); if (!force && now - lastWrite < 800) return;
+  var l = get(LOG), en = { pct: cur, t: now };
+  if (curA) { en.i = curA.i; en.f = curA.f; en.n = curA.n; }
+  l[location.origin + path] = en;
+  put(LOG, keep(l, 60)); lastWrite = now; dirty = false;
+}
+function update() {
+  queued = false;
+  if (!CH.test(path.toLowerCase())) return;
+  if (restoring || preparing) return;
+  var p = measure();
+  if (p < 0) return;
+  var a = anchor();
+  var moved = a && (!curA || a.i !== curA.i || Math.abs(a.f - curA.f) > 0.01);
+  if (a) curA = a;
+  if (p !== cur || moved) { cur = p; dirty = true; save(false); }
+  if (Date.now() > flashUntil) pill.textContent = '📖 ' + cur + ' %';
+}
+// Beim Öffnen an die letzte Stelle springen. Bilder laden nach, deshalb wird kurz nachjustiert,
+// bis die Position stabil ist oder du selbst scrollst.
+function restore(target, anc) {
+  if (!(target > 2 && target < 95)) return;
+  restoring = true; touched = false;
+  var t0 = Date.now(), lastY = -1;
+  flash('↩ Springe zu ' + target + ' %');
+  var iv = setInterval(function () {
+    var done = function () { clearInterval(iv); restoring = false; onScroll(); };
+    if (touched || Date.now() - t0 > 15000) return done();
+    var b = contentBox(); if (!b) return;
+    var vh = window.innerHeight, y;
+    var img = anc && bigImgs.length >= anc.n * 0.9 ? bigImgs[anc.i] : null;
+    if (img) {
+      var ir = img.getBoundingClientRect();
+      y = Math.max(0, ir.top + window.scrollY + anc.f * ir.height - vh * REF);
+    } else y = Math.max(0, b.top + target / 100 * b.height - vh);
+    if (Math.abs(y - window.scrollY) > 8) window.scrollTo(0, y);
+    else if (Math.abs(y - lastY) < 3) done();
+    lastY = y;
+  }, 400);
+}
+['touchstart', 'wheel', 'keydown', 'mousedown'].forEach(function (ev) {
+  window.addEventListener(ev, function () { if (restoring) touched = true; }, { passive: true });
+});
+function onScroll() { if (!queued) { queued = true; requestAnimationFrame(update); } }
+
+function shrink(src, W, H, cb) {
+  GM_xmlhttpRequest({ method: 'GET', url: src, responseType: 'blob', timeout: 15000,
+    onload: function (res) {
+      if (res.status !== 200 || !res.response) return cb('');
+      createImageBitmap(res.response).then(function (bmp) {
+        var c = document.createElement('canvas'); c.width = W; c.height = H;
+        var k = Math.max(W / bmp.width, H / bmp.height), w = bmp.width * k, h = bmp.height * k;
+        c.getContext('2d').drawImage(bmp, (W - w) / 2, (H - h) / 2, w, h);
+        c.getContext('2d').imageSmoothingQuality = 'high';
+        var d = c.toDataURL('image/webp', 0.84);
+        if (d.indexOf('data:image/webp') !== 0) d = c.toDataURL('image/jpeg', 0.86);
+        cb(d);
+      }).catch(function () { cb(''); });
+    },
+    onerror: function () { cb(''); }, ontimeout: function () { cb(''); } });
+}
+function grabCover(force) {
+  var key = location.origin + location.pathname, all = get(COV);
+  if (all[key] && !force) return;
+  var m = document.querySelector('meta[property="og:image"],meta[name="twitter:image"]');
+  var t = document.querySelector('meta[property="og:title"]');
+  if (!m || !m.content) { if (force) flash('Kein Cover gefunden'); return; }
+  shrink(m.content, 360, 480, function (d) {
+    if (!d) return;
+    var cur = get(COV); cur[key] = { img: d, title: t ? t.content : document.title, t: Date.now() };
+    put(COV, keep(cur, 40)); if (force) flash('✓ Cover gemerkt');
+  });
+}
+
+/* ---------- Entdecken: Serien auf Übersichtsseiten einsammeln ---------- */
+var CHNUM = /(?:chapter|chap|ch|episode|ep)[-_\/ .]?(\d+(?:[-_.]\d+)?)/;
+function absUrl(href, base) { try { return new URL(href, base || location.href).href.replace(/[#?].*$/, ''); } catch (e) { return ''; } }
+function pathOf(u) { try { return new URL(u).pathname; } catch (e) { return ''; } }
+function slugBase(u) {
+  return u.replace(/\/$/, '').split('/').pop().toLowerCase()
+    .replace(/-[a-z0-9]{8}$/, function (m) { return /\d/.test(m) ? '' : m; });
+}
+function chOf(u) { var m = pathOf(u).toLowerCase().match(CHNUM); return m ? parseFloat(m[1].replace(/[-_]/, '.')) : null; }
+function isSeriesUrl(u) { var p = pathOf(u); return !!p && SERIES.test(p) && !CH.test(p.toLowerCase()); }
+function onlySeries(el, key, base) {
+  var as = el.querySelectorAll('a[href]');
+  for (var i = 0; i < as.length; i++) {
+    var u = absUrl(as[i].getAttribute('href'));
+    if (isSeriesUrl(u)) { if (u.replace(/\/$/, '') !== key) return false; }
+    else if (chOf(u) != null && pathOf(u).toLowerCase().indexOf(base) < 0) return false;
+  }
+  return true;
+}
+function scrapeCards() {
+  var map = {}, out = [];
+  document.querySelectorAll('a[href]').forEach(function (a) {
+    var u = absUrl(a.getAttribute('href'));
+    if (!isSeriesUrl(u) || new URL(u).hostname !== location.hostname) return;
+    var k = u.replace(/\/$/, ''); (map[k] = map[k] || []).push(a);
+  });
+  Object.keys(map).forEach(function (k) {
+    var as = map[k], base = slugBase(k), card = null;
+    for (var j = 0; j < as.length && !card; j++) {
+      var el = as[j];
+      for (var i = 0; i < 6 && el && el !== document.body; i++) {
+        if (!onlySeries(el, k, base)) break;
+        if (el.tagName === 'IMG' || el.querySelector('img')) card = el;
+        el = el.parentElement;
+      }
+    }
+    card = card || as[0];
+    var title = '';
+    as.forEach(function (a) {
+      var t = (a.getAttribute('title') || a.textContent || '').replace(/\s+/g, ' ').trim();
+      if (t.length > title.length && t.length < 120 && !/^(chapter|kapitel|ch\.?)\s*\d/i.test(t)) title = t;
+    });
+    var img = card.tagName === 'IMG' ? card : card.querySelector('img');
+    if (!title && img) title = img.alt || '';
+    if (!title) return;
+    var text = card.innerText || card.textContent || '', rating = null, re = /(\d{1,2}[.,]\d{1,2})/g, m;
+    while ((m = re.exec(text))) { var v = parseFloat(m[1].replace(',', '.')); if (v > 0 && v <= 10) { rating = v; break; } }
+    var type = badgeType(card) || (/\/novels?\//i.test(k) ? 'Novel' : '');
+    var chN = null, chU = null;
+    card.querySelectorAll('a[href]').forEach(function (a) {
+      var u = absUrl(a.getAttribute('href')), n = chOf(u);
+      if (n != null && (chN == null || n > chN)) { chN = n; chU = u; }
+    });
+    out.push({ url: k, title: title.slice(0, 120), rating: rating, ch: chN, chUrl: chU, type: type,
+      imgSrc: img ? (img.currentSrc || img.src || img.getAttribute('data-src') || '') : '' });
+  });
+  return out;
+}
+function enrich(c, cb) {
+  var base = slugBase(c.url);
+  GM_xmlhttpRequest({ method: 'GET', url: c.url, timeout: 15000,
+    onload: function (r) {
+      var doc = null;
+      try { if (r.status === 200) doc = new DOMParser().parseFromString(r.responseText, 'text/html'); } catch (e) {}
+      var og = doc && doc.querySelector('meta[property="og:image"]'), ot = doc && doc.querySelector('meta[property="og:title"]');
+      var e = { title: (ot && ot.content) || c.title, rating: c.rating, ch: c.ch, chUrl: c.chUrl, img: '', site: location.hostname, t: Date.now(),
+        g: [], desc: '', type: c.type || '', rel: [] };
+      if (doc) {
+        var seen = {}, rel = {};
+        doc.querySelectorAll('a[href]').forEach(function (a) {
+          var hrf = (a.getAttribute('href') || '').toLowerCase();
+          var u = absUrl(a.getAttribute('href'), c.url), n = chOf(u);
+          if (n != null && pathOf(u).toLowerCase().indexOf(base) > -1) {
+            if (e.ch == null || n > e.ch) { e.ch = n; e.chUrl = u; }
+            var dt = parseDate(a.textContent || '');
+            if (dt && !rel[n]) rel[n] = dt;
+            return;
+          }
+          if (/(genre|genres|tag|tags)[\/=]/.test(hrf) && !a.closest('nav,header,footer,[class*="menu"],[id*="menu"]')) {
+            var t = (a.textContent || '').replace(/\s+/g, ' ').trim();
+            if (t && t.length < 30 && !seen[t.toLowerCase()] && e.g.length < 12) { seen[t.toLowerCase()] = 1; e.g.push(t); }
+          }
+        });
+        e.rel = Object.keys(rel).map(function (n) { return [parseFloat(n), rel[n]]; }).sort(function (a, b) { return a[0] - b[0]; }).slice(-20);
+        var md = doc.querySelector('meta[property="og:description"],meta[name="description"]');
+        if (md && md.content) e.desc = md.content.replace(/\s+/g, ' ').trim().slice(0, 700);
+        var bt = doc.body ? (doc.body.textContent || '').slice(0, 40000) : '';
+        var ty = bt.match(/(?:type|typ)\s*:?\s*(manhwa|manga|manhua|novel|webtoon)/i);
+        if (ty) e.type = ty[1].charAt(0).toUpperCase() + ty[1].slice(1).toLowerCase();
+        else if (!e.type) e.type = badgeType(doc.body);
+        if (!e.type && /\/novels?\//i.test(c.url)) e.type = 'Novel';
+      }
+      var src = (og && og.content) || c.imgSrc;
+      if (!src || /^data:/.test(src)) return cb(e);
+      shrink(src, 240, 320, function (d) { e.img = d; cb(e); });
+    },
+    onerror: function () { cb(null); }, ontimeout: function () { cb(null); } });
+}
+// Art (Manhwa, Novel …) aus einem Abzeichen lesen: ein Element, dessen Text genau so heißt
+function badgeType(root) {
+  if (!root) return '';
+  var els = root.querySelectorAll('span,div,a,p,b,i,small,li');
+  for (var i = 0; i < els.length && i < 400; i++) {
+    if (els[i].children.length) continue;
+    var t = (els[i].textContent || '').trim().toLowerCase();
+    if (/^(manhwa|manga|manhua|novel|webtoon)$/.test(t)) return t.charAt(0).toUpperCase() + t.slice(1);
+  }
+  return '';
+}
+// Datum aus dem Text eines Kapitel-Links lesen, z. B. "October 3rd 2025", "Oct 3, 2025", "03.10.2025", "2025-10-03"
+function parseDate(txt) {
+  txt = txt.replace(/\s+/g, ' ');
+  var m = txt.match(/(\d{1,2})\.(\d{1,2})\.(\d{4})/), t = NaN;
+  if (m) t = new Date(+m[3], +m[2] - 1, +m[1]).getTime();
+  else if ((m = txt.match(/(\d{4})-(\d{2})-(\d{2})/))) t = new Date(+m[1], +m[2] - 1, +m[3]).getTime();
+  else if ((m = txt.match(/([A-Za-z]{3,9})\.? (\d{1,2})(?:st|nd|rd|th)?,? (\d{4})/))) t = Date.parse(m[1] + ' ' + m[2] + ', ' + m[3]);
+  if (isNaN(t) || t > Date.now() + 864e5 || t < Date.now() - 4 * 365 * 864e5) return 0;
+  return t;
+}
+function runDisc() {
+  discBusy = true;
+  var done = 0;
+  (function next() {
+    if (!discQ.length || document.hidden) { discBusy = false; if (done) flash('✓ ' + done + ' Manhwas für den Hub gemerkt'); return; }
+    var c = discQ.shift();
+    flash('🔎 Entdecke … noch ' + (discQ.length + 1));
+    enrich(c, function (e) {
+      if (e) { var all = get(DISC); all[c.url] = e; put(DISC, keep(all, 150)); done++; }
+      setTimeout(next, 600);
+    });
+  })();
+}
+function discover() {
+  if (isChapter()) return;
+  var cards = scrapeCards(), all = get(DISC), changed = false;
+  cards.forEach(function (c) {
+    var e = all[c.url];
+    if (e) {
+      var nr = c.rating && c.rating !== e.rating, nc = c.ch != null && c.ch > (e.ch || 0);
+      if (nr) e.rating = c.rating;
+      if (nc) { e.ch = c.ch; e.chUrl = c.chUrl; }
+      if (nr || nc) { e.ack = false; changed = true; }
+      return;
+    }
+    if (discSeen[c.url]) return;
+    discSeen[c.url] = 1; discQ.push(c);
+  });
+  if (changed) put(DISC, keep(all, 150));
+  if (discQ.length && !discBusy) runDisc();
+}
+
+function copyAll() {
+  save(true);
+  var t = token(true);
+  if (!t) { flash('Noch nichts gemerkt'); return; }
+  GM_setClipboard(t, 'text');
+  var cv = get(COV); Object.keys(cv).forEach(function (k) { if (!cv[k].ack) cv[k].sent = (cv[k].sent || 0) + 1; }); put(COV, cv);
+  flash('✓ Kopiert. Für einen anderen Browser');
+}
+
+function route() {
+  if (location.pathname === path) return;
+  save(true);
+  teardownReader();
+  path = location.pathname; box = null; imgCount = -1;
+  if (CH.test(path.toLowerCase())) {
+    var e = get(LOG)[location.origin + path], target = (e && e.pct) || 0;
+    var anc = e && e.i != null ? { i: e.i, f: e.f, n: e.n } : null;
+    var hm = location.hash.match(/mhub-(\d{1,3})/);
+    if (hm) {
+      // Kommt der Stand von einem anderen Gerät, passt der lokale Anker nicht mehr
+      if (!e || Math.abs(e.pct - +hm[1]) > 3) anc = null;
+      target = +hm[1];
+      try { history.replaceState(history.state, '', location.pathname + location.search); } catch (err) {}
+    }
+    cur = target;
+    pill.style.display = 'block'; pill.textContent = '📖 ' + cur + ' %';
+    cleanBtn.style.display = 'block'; cleanLabel();
+    showDock(3000);
+    curA = null;
+    savedT = target; savedA = anc;
+    var myPath = path;
+    prepareReader(function () {
+      if (path !== myPath) return;
+      if (target > 2 && target < 95) restore(target, anc); else onScroll();
+    });
+  } else {
+    pill.style.display = 'none'; cleanBtn.style.display = 'none';
+    clearTimeout(dockT); dock.style.opacity = '1'; dock.style.pointerEvents = 'auto';
+    if (SERIES.test(path)) {
+      setTimeout(function () { grabCover(false); }, 1500);
+      var self = (location.origin + path).replace(/\/$/, '');
+      if (!get(DISC)[self] && !discSeen[self]) { discSeen[self] = 1; discQ.unshift({ url: self, title: document.title, rating: null, ch: null, chUrl: null, imgSrc: '' }); }
+    }
+    clearTimeout(discT); discT = setTimeout(discover, 2500);
+  }
+}
+
+// Tipp auf die Prozentanzeige: zurück an die Stelle, an der du das Kapitel zuletzt verlassen hattest
+pill.addEventListener('click', function () {
+  if (!isChapter()) { copyAll(); return; }
+  if (restoring) return;
+  if (savedT > 2 && savedT < 95 && Math.abs(cur - savedT) > 1) restore(savedT, savedA);
+  else flash(savedT > 2 && savedT < 95 ? 'Du bist schon an deiner Stelle' : 'Noch keine gespeicherte Stelle');
+});
+window.addEventListener('scroll', function () {
+  onScroll();
+  if (!isChapter()) { clearTimeout(discT); discT = setTimeout(discover, 2000); }
+}, { passive: true });
+window.addEventListener('pagehide', function () { save(true); });
+document.addEventListener('visibilitychange', function () { if (document.hidden) save(true); });
+if (typeof GM_registerMenuCommand === 'function') {
+  GM_registerMenuCommand('Stand kopieren', copyAll);
+  GM_registerMenuCommand('Cover dieser Seite merken', function () { grabCover(true); });
+}
+setInterval(function () { route(); if (isChapter()) onScroll(); }, 1200);
+route();
+if (!isChapter()) flash('📖 Manhwa Hub aktiv');
+
+})({ GM_getValue: GM_getValue, GM_setValue: GM_setValue, GM_setClipboard: GM_setClipboard,
+  GM_xmlhttpRequest: GM_xmlhttpRequest, GM_registerMenuCommand: GM_registerMenuCommand,
+  GM_addValueChangeListener: typeof GM_addValueChangeListener === 'function' ? GM_addValueChangeListener : null,
+  uw: typeof unsafeWindow !== 'undefined' ? unsafeWindow : null });
