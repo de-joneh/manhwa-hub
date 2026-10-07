@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.14.0
+// @version      3.15.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.14.0';
+var VERSION = '3.15.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -217,7 +217,7 @@ function flash(t) {
 }
 
 /* ---------- Lesemodus: nur die Bilder ---------- */
-var preparing = false, CLEAN_KEY = 'mhub_clean', reader = null, readerStyle = null, readerObs = null, readerSrcs = {};
+var preparing = false, CLEAN_KEY = 'mhub_clean', reader = null, readerStyle = null, readerObs = null, readerSrcs = {}, readerNav = null;
 function cleanOn() { return GM_getValue(CLEAN_KEY, '1') === '1'; }
 // Größte verfügbare Bildversion: srcset, <picture>-Quellen und Next.js-Bildproxy (/_next/image?url=…)
 function pickSet(set) {
@@ -275,11 +275,15 @@ function buildReader() {
   if (addReaderImgs(srcImgs) < 3) { reader = null; return 'skip'; }
   readerStyle = document.createElement('style');
   readerStyle.textContent = 'html,body{background:#0b0a10!important;overflow-x:hidden!important;overflow-y:auto!important;margin:0!important}' +
-    'body>*:not(#mhub-reader):not(#mhub-dock){display:none!important}' +
-    '#mhub-reader{display:block!important;background:#0b0a10;padding:0 0 110px;margin:0;touch-action:manipulation}' +
+    'body>*:not(#mhub-reader):not(#mhub-dock):not(#mhub-nav){display:none!important}' +
+    '#mhub-nav{display:flex!important;gap:8px;max-width:820px;margin:0 auto;padding:18px 12px 120px;background:#0b0a10;font:700 15px system-ui,sans-serif}' +
+    '#mhub-nav a{flex:1;display:flex;align-items:center;justify-content:center;min-height:52px;border-radius:12px;background:#2a2639;color:#ece9f6;text-decoration:none;text-align:center;padding:0 10px}' +
+    '#mhub-nav a.nx{background:#913fe2;color:#fff;flex:1.4}#mhub-nav span{flex:1.4;display:flex;align-items:center;justify-content:center;color:#9893b0}' +
+    '#mhub-reader{display:block!important;background:#0b0a10;padding:0;margin:0;touch-action:manipulation}' +
     '#mhub-reader img{display:block;width:100%;max-width:820px;height:auto;margin:0 auto;border:0}';
   (document.head || document.documentElement).appendChild(readerStyle);
   document.body.appendChild(reader);
+  readerNav = chapterNav(); if (readerNav) document.body.appendChild(readerNav);
   if (dock.parentNode) document.body.appendChild(dock);
   // Klicks im Leser nicht an die Seite durchreichen, damit dort keine Werbe-Fenster aufgehen
   ['click', 'mousedown', 'mouseup', 'touchend', 'pointerup', 'auxclick'].forEach(function (ev) {
@@ -303,7 +307,42 @@ function teardownReader() {
   if (readerObs) { readerObs.disconnect(); readerObs = null; }
   if (reader && reader.parentNode) reader.parentNode.removeChild(reader);
   if (readerStyle && readerStyle.parentNode) readerStyle.parentNode.removeChild(readerStyle);
-  reader = null; readerStyle = null; readerSrcs = {};
+  if (readerNav && readerNav.parentNode) readerNav.parentNode.removeChild(readerNav);
+  reader = null; readerStyle = null; readerSrcs = {}; readerNav = null;
+}
+// Knöpfe am Kapitelende im Lesemodus: vorheriges Kapitel, Serienseite, nächstes Kapitel.
+// Links stammen von der Seite selbst; fehlt einer, wird er gebaut, wenn der Hub das Kapitel kennt.
+var CHPART = /((?:chapter|chap|ch|episode|ep)[-_\/ .]?)(\d+(?:[-_.]\d+)?)/i;
+function chapterNav() {
+  var m = path.match(CHPART); if (!m) return null;
+  var n = parseFloat(m[2].replace(/[-_]/, '.')), head = path.slice(0, m.index), strip = function (p) { return p.toLowerCase().replace(CHPART, '#'); };
+  var found = {}, me = strip(path);
+  document.querySelectorAll('a[href]').forEach(function (a) {
+    var u = absUrl(a.getAttribute('href')), k = chOf(u);
+    if (k == null || strip(pathOf(u)) !== me || new URL(u).hostname !== location.hostname) return;
+    if (!found[k]) found[k] = u;
+  });
+  var key = slugBase(head.replace(/[-_\/]+$/, '')).replace(/[^a-z0-9]/g, ''), e = key ? libEntry(key) : null;
+  var make = function (k) { return location.origin + path.replace(CHPART, function (all, a) { return a + k; }); };
+  var prevN = Math.ceil(n) - 1, nextN = Math.floor(n) + 1;
+  var prev = found[prevN] || (prevN >= 1 ? make(prevN) : '');
+  var next = found[nextN] || (e && e.m >= nextN ? make(nextN) : '');
+  var home = head.replace(/[-_\/]+$/, ''), homeUrl = isSeriesUrl(location.origin + home) ? location.origin + home : '';
+  var nav = document.createElement('div'); nav.id = 'mhub-nav';
+  var link = function (href, text, cls) {
+    var a = document.createElement('a'); a.href = href; a.textContent = text; if (cls) a.className = cls;
+    // Nächstes Kapitel: dieses als fertig gelesen speichern
+    if (cls === 'nx') a.addEventListener('click', function () { cur = 100; curA = null; dirty = true; save(true); });
+    else a.addEventListener('click', function () { save(true); });
+    nav.appendChild(a);
+  };
+  if (prev) link(prev, '‹ ' + prevN);
+  if (homeUrl) link(homeUrl, 'Serie');
+  if (next) link(next, 'Kapitel ' + nextN + ' ›', 'nx');
+  else { var sp = document.createElement('span'); sp.textContent = 'Neuestes Kapitel ✓'; nav.appendChild(sp); }
+  // Klicks nicht an die Seite weitergeben (Werbe-Fenster)
+  nav.addEventListener('click', function (ev) { ev.stopPropagation(); });
+  return nav;
 }
 function blockPopups() {
   var w = GM.uw; if (!w) return;
