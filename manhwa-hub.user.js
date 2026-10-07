@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.24.0
+// @version      3.25.1
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.24.0';
+var VERSION = '3.25.1';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -225,7 +225,7 @@ function toggleMode() {
     if (toOrig) showDock(4000, true); else { quietUntil = Date.now() + 20000; hideDock(); }
   };
   if (toOrig) { teardownReader(); pre = {}; curDoc = null; setTimeout(finish, 60); }
-  else prepareReader(function () { finish(); setTimeout(prefetchNeighbors, 2500); });
+  else prepareReader(function () { finish(); setTimeout(prefetchNeighbors, 300); });
 }
 cleanBtn.addEventListener('click', toggleMode);
 dock.appendChild(pill); dock.appendChild(cleanBtn); dock.appendChild(homeBtn);
@@ -389,8 +389,8 @@ function leaveChapter() {
   if (cur >= 85) { cur = 100; curA = null; }
   dirty = true; save(true);
 }
-function goNext(url) { if (reader && pre[url] && pre[url].state === 'ok') return slideTo(url, 1); leaveChapter(); location.href = url; }
-function goPrev(url) { if (reader && pre[url] && pre[url].state === 'ok') return slideTo(url, -1); leaveChapter(); location.href = url; }
+function goNext(url) { if (reader && prefs().swipe) return slideTo(url, 1); leaveChapter(); location.href = url; }
+function goPrev(url) { if (reader && prefs().swipe) return slideTo(url, -1); leaveChapter(); location.href = url; }
 function chapterNav() {
   var t = chapterTargets(); if (!t) return null;
   var prev = t.prev, prevN = t.prevN, next = t.next, nextN = t.nextN, homeUrl = t.homeUrl;
@@ -525,22 +525,46 @@ function imgsFromHtml(html, doc) {
   }
   return out;
 }
+// Gespeicherte Stelle in einem Kapitel (aus dem Lesestand), passend zu dessen Bildern
+function ancFor(u, imgs) {
+  var le = get(LOG)[String(u).replace(/[#?].*$/, '')];
+  if (le && le.pct > 2 && le.pct < 95 && le.i != null && imgs && imgs.length && Math.abs((le.n || 0) - imgs.length) <= Math.max(2, imgs.length * 0.1)) return { i: Math.min(le.i, imgs.length - 1), f: le.f || 0 };
+  return null;
+}
+// Kapitel holen (einmal), Ergebnis im Speicher pre[url] = {state: loading|ok|none, imgs, doc}; Wartende werden benachrichtigt
+function fetchChapter(u) {
+  if (pre[u] && pre[u].state !== 'none') return pre[u];
+  var e = pre[u] = { state: 'loading', url: u, w: [], t: Date.now() };
+  var fin = function () { var w = e.w; e.w = []; w.forEach(function (f) { try { f(); } catch (er) {} }); };
+  fetch(u, { credentials: 'include' }).then(function (r) { return r.ok ? r.text() : ''; }).then(function (html) {
+    var doc = html ? new DOMParser().parseFromString(html, 'text/html') : null, imgs = html ? imgsFromHtml(html, doc) : [];
+    e.imgs = imgs; e.doc = doc; e.state = imgs.length >= 3 ? 'ok' : 'none';
+    // Bilder dort vorladen, wo du weiterlesen würdest
+    var a = ancFor(u, imgs), from = a ? Math.max(0, a.i - 1) : 0;
+    if (e.state === 'ok' && prefs().preload) imgs.slice(from, from + 4).forEach(function (src) { var im = new Image(); im.decoding = 'async'; im.src = src; });
+    fin();
+  }).catch(function () { e.state = 'none'; fin(); });
+  // Höchstens 8 Kapitel merken
+  var ks = Object.keys(pre); if (ks.length > 8) ks.sort(function (a, b) { return pre[a].t - pre[b].t; }).slice(0, ks.length - 8).forEach(function (k) { if (k !== u) delete pre[k]; });
+  return e;
+}
+// Wartet, bis ein Kapitel geholt ist (höchstens ms), dann cb(eintrag) oder cb(null)
+function whenReady(u, ms, cb) {
+  var e = fetchChapter(u);
+  if (e.state !== 'loading') return cb(e.state === 'ok' ? e : null);
+  var done = false, t = setTimeout(function () { if (!done) { done = true; cb(null); } }, ms);
+  e.w.push(function () { if (done) return; done = true; clearTimeout(t); cb(e.state === 'ok' ? e : null); });
+}
 function prefetchNeighbors() {
   if (!reader || !prefs().swipe) return;
   var t = chapterTargets(); if (!t) return;
-  [t.next, t.prev].forEach(function (u) {
-    if (!u || pre[u]) return;
-    pre[u] = { state: 'loading' };
-    fetch(u, { credentials: 'include' }).then(function (r) { return r.ok ? r.text() : ''; }).then(function (html) {
-      var doc = html ? new DOMParser().parseFromString(html, 'text/html') : null, imgs = html ? imgsFromHtml(html, doc) : [];
-      // Gespeicherte Stelle in diesem Kapitel? Dann die Bilder dort vorladen statt am Anfang
-      var le = get(LOG)[u.replace(/[#?].*$/, '')], anc = null;
-      if (le && le.pct > 2 && le.pct < 95 && le.i != null && imgs.length && Math.abs((le.n || 0) - imgs.length) <= Math.max(2, imgs.length * 0.1)) anc = { i: Math.min(le.i, imgs.length - 1), f: le.f || 0 };
-      pre[u] = { state: imgs.length >= 3 ? 'ok' : 'none', imgs: imgs, doc: doc, anc: anc };
-      var from = anc ? Math.max(0, anc.i - 1) : 0;
-      if (prefs().preload) imgs.slice(from, from + 4).forEach(function (src) { var i = new Image(); i.decoding = 'async'; i.src = src; });
-    }).catch(function () { pre[u] = { state: 'none' }; });
-  });
+  [t.next, t.prev].forEach(function (u) { if (u) fetchChapter(u); });
+}
+// Das aktuelle Kapitel merken, bevor es verlassen wird: Zurückwischen braucht dann nichts zu laden
+function rememberCurrent() {
+  if (!reader) return;
+  var u = location.origin + path, imgs = [].map.call(reader.querySelectorAll('img'), function (im) { return im.getAttribute('src'); }).filter(Boolean);
+  if (imgs.length >= 3) pre[u] = { state: 'ok', url: u, imgs: imgs, doc: curDoc || document, w: [], t: Date.now() };
 }
 function moveReader(x, ms) {
   [reader, readerNav].forEach(function (el) {
@@ -554,9 +578,10 @@ function makePeek(p, dir) {
   dropPeek();
   var d = document.createElement('div'); d.id = 'mhub-peek'; d._dir = dir;
   d.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100vh;overflow:hidden;z-index:2147483640;background:#0b0a10;pointer-events:none;will-change:transform;transform:translateX(' + (dir * viewW()) + 'px)';
-  var a = p.anc, from = a ? Math.max(0, a.i - 1) : 0, inner = document.createElement('div'), els = [];
+  var a = ancFor(p.url, p.imgs), from = a ? Math.max(0, a.i - 1) : 0, inner = document.createElement('div'), els = [];
   inner.style.cssText = 'position:absolute;left:0;right:0;top:0';
-  p.imgs.slice(from, from + 4).forEach(function (src) { var i = new Image(); i.src = src; i.alt = ''; i.style.cssText = 'display:block;width:100%;max-width:820px;height:auto;margin:0 auto'; inner.appendChild(i); els.push(i); });
+  // Synchron zeichnen: sonst lässt der Browser die Bilder beim Springen der Seite darunter ein Bild lang weg (schwarz)
+  p.imgs.slice(from, from + 4).forEach(function (src) { var i = new Image(); i.decoding = 'sync'; i.src = src; i.alt = ''; i.style.cssText = 'display:block;width:100%;max-width:820px;height:auto;margin:0 auto'; if (i.decode) i.decode().catch(function () {}); inner.appendChild(i); els.push(i); });
   d.appendChild(inner);
   document.body.appendChild(d);
   // Wie restore(): Bild a.i, Anteil a.f liegt auf der Linie bei 30 % der Bildschirmhöhe
@@ -573,6 +598,12 @@ function makePeek(p, dir) {
   }
   return (peek = d);
 }
+// Vorschau erst ausblenden, wenn die sichtbaren Bilder darunter fertig dekodiert sind (sonst ein schwarzes Bild)
+function fadePeekWhenReady() {
+  var vh = window.innerHeight, ims = reader ? [].filter.call(reader.querySelectorAll('img'), function (im) { var r = im.getBoundingClientRect(); return r.bottom > 0 && r.top < vh; }) : [];
+  var wait = ims.map(function (im) { return im.decode ? im.decode().catch(function () {}) : Promise.resolve(); });
+  Promise.race([Promise.all(wait), new Promise(function (r) { setTimeout(r, 700); })]).then(function () { requestAnimationFrame(fadePeek); });
+}
 // Vorschau ausblenden, wenn die echte Seite darunter an derselben Stelle steht
 function fadePeek() {
   var pk = peek; peek = null; if (!pk) return;
@@ -582,29 +613,48 @@ function fadePeek() {
 function dropPeek() { if (peek && peek.parentNode) peek.parentNode.removeChild(peek); peek = null; }
 function movePeek(x, ms) { if (!peek) return; peek.style.transition = ms ? 'transform ' + ms + 'ms ease-out' : 'none'; peek.style.transform = 'translateX(' + x + 'px)'; }
 // dir 1 = weiter (Inhalt geht nach links), -1 = zurück
+var sliding = false;
 function slideTo(url, dir) {
-  var p = pre[url], W = viewW();
+  if (sliding) return;
+  sliding = true;
   leaveChapter(); asStop(true);
-  if (p && p.state === 'ok') {
-    if (!peek || peek._dir !== dir) { makePeek(p, dir); peek.getBoundingClientRect(); }
-    moveReader(-dir * W, 240); movePeek(0, 240);
-    setTimeout(function () { swapChapter(url, p, dir); }, 250);
-    return;
+  var e = fetchChapter(url);
+  if (e.state === 'loading') {
+    // Noch unterwegs: kurz warten statt neu zu laden, mit Hinweis
+    moveReader(-dir * viewW() * 0.12, 160);
+    loadingHint(dir, true);
   }
-  dropPeek();
-  moveReader(-dir * W, 200);
-  {
+  whenReady(url, 4000, function (p) {
+    loadingHint(dir, false);
+    if (p) return doSlide(url, p, dir);
+    // Bilder nicht zu finden: normal laden, mit Gleit-Animation
+    dropPeek(); moveReader(-dir * viewW(), 200);
     GM_setValue('mhub_slide', JSON.stringify({ d: dir, t: Date.now() }));
     setTimeout(function () { location.href = url; }, 190);
-  }
+  });
+}
+function doSlide(url, p, dir) {
+  var W = viewW();
+  if (!peek || peek._dir !== dir) { makePeek(p, dir); peek.getBoundingClientRect(); }
+  moveReader(-dir * W, 240); movePeek(0, 240);
+  setTimeout(function () { swapChapter(url, p, dir); }, 250);
+}
+function loadingHint(dir, on) {
+  if (!swHint) hint(dir > 0 ? -1 : 1, {});
+  if (!on) { swHint.style.display = 'none'; return; }
+  var t = chapterTargets() || {};
+  swHint.textContent = (dir > 0 ? L('Kapitel ', 'Chapter ') + t.nextN : L('Kapitel ', 'Chapter ') + t.prevN) + ' …';
+  swHint.style.left = dir > 0 ? '' : '12px'; swHint.style.right = dir > 0 ? '12px' : '';
+  swHint.style.background = '#913fe2'; swHint.style.opacity = '1'; swHint.style.display = 'block';
 }
 function swapChapter(url, p, dir) {
-  var u = new URL(url, location.href);
+  var u = new URL(url, location.href), a = ancFor(url, p.imgs);
+  rememberCurrent();
   if (readerObs) { readerObs.disconnect(); readerObs = null; }
   reader.innerHTML = ''; readerSrcs = {};
   p.imgs.forEach(function (src, k) {
     readerSrcs[src] = 1;
-    var n = document.createElement('img'); n.src = src; n.alt = ''; n.decoding = 'async'; if (k > (p.anc ? p.anc.i + 3 : 3)) n.loading = 'lazy';
+    var n = document.createElement('img'); n.src = src; n.alt = ''; n.decoding = a && k >= a.i - 1 && k <= a.i + 2 ? 'sync' : 'async'; if (k > (a ? a.i + 3 : 3)) n.loading = 'lazy';
     reader.appendChild(n);
   });
   // Erst den eigenen Pfad setzen, dann die Adresse: so baut route() nichts neu auf
@@ -618,8 +668,8 @@ function swapChapter(url, p, dir) {
   moveReader(0, 0);
   // Die Vorschau zeigt schon genau diese Stelle und bleibt liegen, bis die Seite darunter dort steht
   enterChapter();
-  pre = {};
-  setTimeout(prefetchNeighbors, 1200);
+  sliding = false;
+  setTimeout(prefetchNeighbors, 300);
 }
 // Stand des (neuen) Kapitels laden und an die gespeicherte Stelle springen
 function enterChapter() {
@@ -628,9 +678,9 @@ function enterChapter() {
   cur = target; curA = null; dirty = false; savedT = target; savedA = anc;
   pill.textContent = '📖 ' + cur + ' %';
   if (target > 2 && target < 95) {
-    if (peek) { var pk = peek; setTimeout(function () { if (peek === pk) fadePeek(); }, 3000); restore(target, anc, { quiet: true, fast: true, done: fadePeek }); }
+    if (peek) { var pk = peek; setTimeout(function () { if (peek === pk) fadePeek(); }, 3000); restore(target, anc, { quiet: true, fast: true, done: fadePeekWhenReady }); }
     else { fadeCover(true); restore(target, anc, { quiet: true, fast: true, done: function () { fadeCover(false); } }); }
-  } else { onScroll(); requestAnimationFrame(function () { requestAnimationFrame(fadePeek); }); }
+  } else { onScroll(); fadePeekWhenReady(); }
 }
 // Nach einem normalen Wechsel per Wischen: neues Kapitel von der Seite hereingleiten lassen
 function slideIn() {
@@ -669,7 +719,7 @@ window.addEventListener('touchmove', function (e) {
   if (!sw0.h) return;
   e.preventDefault();
   sw0.dx = dx;
-  var ok = dx < 0 ? sw0.tg.next : sw0.tg.prev, dir = dx < 0 ? 1 : -1, p = ok && pre[ok];
+  var ok = dx < 0 ? sw0.tg.next : sw0.tg.prev, dir = dx < 0 ? 1 : -1, p = ok && fetchChapter(ok);
   moveReader(ok ? dx : dx * 0.25, 0);
   if (p && p.state === 'ok') { if (!peek || peek._dir !== dir) makePeek(p, dir); movePeek(dir * viewW() + dx, 0); if (swHint) swHint.style.display = 'none'; }
   else { dropPeek(); hint(dx, sw0.tg); }
@@ -1260,7 +1310,7 @@ function route() {
     prepareReader(function () {
       if (path !== myPath) return;
       if (target > 2 && target < 95) restore(target, anc); else onScroll();
-      slideIn(); setTimeout(prefetchNeighbors, 2500);
+      slideIn(); setTimeout(prefetchNeighbors, 300);
       asLevel = prefs().speed;
       if (DESK && prefs().auto === 'start') autoStartWhenReady(myPath);
     });
