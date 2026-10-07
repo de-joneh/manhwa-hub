@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.15.0
+// @version      3.16.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.15.0';
+var VERSION = '3.16.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -183,15 +183,23 @@ var cleanBtn = document.createElement('div');
 cleanBtn.setAttribute('role', 'button');
 cleanBtn.style.cssText = 'display:none;background:#17121f;color:#fff;padding:9px 11px;border-radius:999px;box-shadow:0 3px 12px rgba(0,0,0,.45);cursor:pointer;border:1px solid #3a3350;font-size:13px';
 function cleanLabel() { cleanBtn.textContent = cleanOn() ? 'Original' : 'Nur Bilder'; cleanBtn.setAttribute('aria-label', cleanOn() ? 'Originalseite anzeigen' : 'Nur die Bilder anzeigen'); }
-cleanBtn.addEventListener('click', function () {
+// Zwischen Original und „Nur Bilder“ wechseln. Nach dem Neuladen zeigt die Leiste sich nur beim Wechsel zu Original.
+var switching = false, quietUntil = 0;
+function toggleMode() {
+  if (switching) return;
+  switching = true;
   save(true);
-  GM_setValue(CLEAN_KEY, cleanOn() ? '0' : '1');
+  var toOrig = cleanOn();
+  GM_setValue(CLEAN_KEY, toOrig ? '0' : '1');
+  GM_setValue('mhub_switch', JSON.stringify({ to: toOrig ? 'orig' : 'clean', t: Date.now() }));
   location.reload();
-});
+}
+cleanBtn.addEventListener('click', toggleMode);
 dock.appendChild(pill); dock.appendChild(cleanBtn); dock.appendChild(homeBtn);
-// In Kapiteln ist die Leiste versteckt. Doppeltipp zeigt sie für 3 Sekunden.
+// In Kapiteln ist die Leiste versteckt. Doppeltipp wechselt direkt zwischen Original und „Nur Bilder“.
 var dockT = 0;
-function showDock(ms) {
+function showDock(ms, force) {
+  if (!force && Date.now() < quietUntil) return;
   dock.style.opacity = '1'; dock.style.pointerEvents = 'auto';
   clearTimeout(dockT);
   if (isChapter()) dockT = setTimeout(hideDock, ms || 3000);
@@ -203,11 +211,11 @@ window.addEventListener('touchmove', function () { tapMoved = true; }, { passive
 window.addEventListener('touchend', function (e) {
   if (!isChapter() || tapMoved || e.touches.length || dock.contains(e.target)) return;
   var t = e.changedTouches[0], now = Date.now();
-  if (now - lastTap < 350 && Math.abs(t.clientX - tapX) < 40 && Math.abs(t.clientY - tapY) < 40) { lastTap = 0; showDock(3000); }
+  if (now - lastTap < 350 && Math.abs(t.clientX - tapX) < 40 && Math.abs(t.clientY - tapY) < 40) { lastTap = 0; toggleMode(); }
   else { lastTap = now; tapX = t.clientX; tapY = t.clientY; }
 }, { passive: true, capture: true });
-window.addEventListener('dblclick', function (e) { if (isChapter() && !dock.contains(e.target)) showDock(3000); }, true);
-dock.addEventListener('click', function () { if (isChapter()) showDock(3000); }, true);
+window.addEventListener('dblclick', function (e) { if (isChapter() && !dock.contains(e.target)) toggleMode(); }, true);
+dock.addEventListener('click', function () { if (isChapter()) showDock(3000, true); }, true);
 (document.body || document.documentElement).appendChild(dock);
 function flash(t) {
   pill.textContent = t; pill.style.display = 'block'; flashUntil = Date.now() + 2500;
@@ -752,7 +760,12 @@ function route() {
     cur = target;
     pill.style.display = 'block'; pill.textContent = '📖 ' + cur + ' %';
     cleanBtn.style.display = 'block'; cleanLabel();
-    showDock(3000);
+    // Gerade per Doppeltipp gewechselt? Zu Original: Leiste kurz zeigen. Zu „Nur Bilder“: nichts einblenden.
+    var sw = null; try { sw = JSON.parse(GM_getValue('mhub_switch', 'null')); } catch (err) {}
+    if (sw && Date.now() - sw.t < 15000) {
+      GM_setValue('mhub_switch', 'null');
+      if (sw.to === 'clean') { quietUntil = Date.now() + 20000; hideDock(); } else showDock(4000);
+    } else showDock(3000);
     curA = null;
     savedT = target; savedA = anc;
     var myPath = path;
