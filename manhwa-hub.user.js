@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.20.0
+// @version      3.21.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.20.0';
+var VERSION = '3.21.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -187,16 +187,44 @@ var cleanBtn = document.createElement('div');
 cleanBtn.setAttribute('role', 'button');
 cleanBtn.style.cssText = 'display:none;background:#17121f;color:#fff;padding:9px 11px;border-radius:999px;box-shadow:0 3px 12px rgba(0,0,0,.45);cursor:pointer;border:1px solid #3a3350;font-size:13px';
 function cleanLabel() { cleanBtn.textContent = cleanOn() ? 'Original' : L('Nur Bilder', 'Images only'); cleanBtn.setAttribute('aria-label', cleanOn() ? L('Originalseite anzeigen', 'Show original page') : L('Nur die Bilder anzeigen', 'Show images only')); }
-// Zwischen Original und „Nur Bilder“ wechseln. Nach dem Neuladen zeigt die Leiste sich nur beim Wechsel zu Original.
+// Kurz abblenden, damit man das Nachjustieren der Stelle nicht sieht
+function fadeCover(on) {
+  var f = document.getElementById('mhub-fade');
+  if (on) {
+    if (!f) { f = document.createElement('div'); f.id = 'mhub-fade'; f.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:#0b0a10;z-index:2147483645;pointer-events:none;opacity:1;transition:opacity .2s'; (document.body || document.documentElement).appendChild(f); }
+    f.style.opacity = '1'; clearTimeout(fadeCover.t); fadeCover.t = setTimeout(function () { fadeCover(false); }, 2500); return;
+  }
+  clearTimeout(fadeCover.t);
+  if (f) { f.style.opacity = '0'; setTimeout(function () { if (f.parentNode && f.style.opacity === '0') f.parentNode.removeChild(f); }, 250); }
+}
+// Zwischen Original und „Nur Bilder“ wechseln, ohne die Seite neu zu laden: die versteckte Originalseite wird
+// wieder gezeigt (oder der Leser neu gebaut) und die Stelle über den Anker (Bild + Anteil) übernommen.
+// Danach zeigt sich die Leiste nur beim Wechsel zu Original.
 var switching = false, quietUntil = 0;
 function toggleMode() {
   if (switching) return;
   switching = true;
-  save(true);
   var toOrig = cleanOn();
+  var a = anchor() || curA, p = measure(); if (p < 0) p = cur;
+  if (p >= 0) { cur = p; curA = a; dirty = true; }
+  save(true);
   GM_setValue(CLEAN_KEY, toOrig ? '0' : '1');
-  GM_setValue('mhub_switch', JSON.stringify({ to: toOrig ? 'orig' : 'clean', t: Date.now() }));
-  location.reload();
+  // Nach einem Wechsel per Wischen zeigt die versteckte Originalseite noch das alte Kapitel: dann sauber neu laden
+  if (inlineNav) {
+    GM_setValue('mhub_switch', JSON.stringify({ to: toOrig ? 'orig' : 'clean', t: Date.now() }));
+    location.reload(); return;
+  }
+  asStop(true); dropPeek(); fadeCover(true);
+  var finish = function () {
+    box = null; imgCount = -1; bigImgs = []; findBox();
+    var end = function () { fadeCover(false); switching = false; onScroll(); };
+    if (p > 2 && p < 95) restore(p, a, { quiet: true, fast: true, done: end });
+    else { window.scrollTo(0, p >= 95 ? document.documentElement.scrollHeight : 0); end(); }
+    cleanLabel();
+    if (toOrig) showDock(4000, true); else { quietUntil = Date.now() + 20000; hideDock(); }
+  };
+  if (toOrig) { teardownReader(); pre = {}; curDoc = null; setTimeout(finish, 60); }
+  else prepareReader(function () { finish(); setTimeout(prefetchNeighbors, 2500); });
 }
 cleanBtn.addEventListener('click', toggleMode);
 dock.appendChild(pill); dock.appendChild(cleanBtn); dock.appendChild(homeBtn);
@@ -287,7 +315,7 @@ function buildReader() {
   if (addReaderImgs(srcImgs) < 3) { reader = null; return 'skip'; }
   readerStyle = document.createElement('style');
   readerStyle.textContent = 'html,body{background:#0b0a10!important;overflow-x:hidden!important;overflow-y:auto!important;margin:0!important}' +
-    'body>*:not(#mhub-reader):not(#mhub-dock):not(#mhub-nav):not(#mhub-peek){display:none!important}' +
+    'body>*:not(#mhub-reader):not(#mhub-dock):not(#mhub-nav):not(#mhub-peek):not(#mhub-fade){display:none!important}' +
     '#mhub-nav{display:flex!important;gap:8px;max-width:820px;margin:0 auto;padding:18px 12px 120px;background:#0b0a10;font:700 15px system-ui,sans-serif}' +
     '#mhub-nav a{flex:1;display:flex;align-items:center;justify-content:center;min-height:52px;border-radius:12px;background:#2a2639;color:#ece9f6;text-decoration:none;text-align:center;padding:0 10px}' +
     '#mhub-nav a.nx{background:#913fe2;color:#fff;flex:1.4}#mhub-nav span{flex:1.4;display:flex;align-items:center;justify-content:center;color:#9893b0}' +
@@ -345,8 +373,14 @@ function chapterTargets() {
   return { prev: prev, prevN: prevN, next: next, nextN: nextN, homeUrl: homeUrl };
 }
 // Als gelesen speichern und zum nächsten Kapitel
-function goNext(url) { if (reader && pre[url] && pre[url].state === 'ok') return slideTo(url, 1); cur = 100; curA = null; dirty = true; save(true); location.href = url; }
-function goPrev(url) { if (reader && pre[url] && pre[url].state === 'ok') return slideTo(url, -1); save(true); location.href = url; }
+// Beim Verlassen die echte Stelle speichern, damit man beim Zurückkommen dort landet. Fast am Ende zählt als fertig
+function leaveChapter() {
+  var m = measure(); if (m >= 0) { cur = m; curA = anchor() || curA; }
+  if (cur >= 85) { cur = 100; curA = null; }
+  dirty = true; save(true);
+}
+function goNext(url) { if (reader && pre[url] && pre[url].state === 'ok') return slideTo(url, 1); leaveChapter(); location.href = url; }
+function goPrev(url) { if (reader && pre[url] && pre[url].state === 'ok') return slideTo(url, -1); leaveChapter(); location.href = url; }
 function chapterNav() {
   var t = chapterTargets(); if (!t) return null;
   var prev = t.prev, prevN = t.prevN, next = t.next, nextN = t.nextN, homeUrl = t.homeUrl;
@@ -460,7 +494,12 @@ function imgsFromHtml(html, doc) {
   var mine = Object.keys(readerSrcs); if (!mine.length) return [];
   var cnt = {}; mine.forEach(function (u) { var h = hostOf(u); cnt[h] = (cnt[h] || 0) + 1; });
   var host = Object.keys(cnt).sort(function (a, b) { return cnt[b] - cnt[a]; })[0], skip = {}, out = [], seen = {};
-  [].forEach.call(document.images, function (im) { if (!reader.contains(im) && !(bigImgs.indexOf(im) > -1)) { var u = unproxy(imgSrc(im)); if (u) skip[u] = 1; } });
+  // Nur kleine Bilder der Seite (Logo, Symbole) aussortieren. Große versteckte Bilder können ein anderes Kapitel sein
+  [].forEach.call(document.images, function (im) {
+    if (reader.contains(im)) return;
+    var aw = +im.getAttribute('width'), nw = im.naturalWidth;
+    if ((aw > 0 && aw < 250) || (nw > 0 && nw < 250)) { var u = unproxy(imgSrc(im)); if (u) skip[u] = 1; }
+  });
   var og = doc && doc.querySelector('meta[property="og:image"]'); if (og && og.content) skip[unproxy(og.content)] = 1;
   var add = function (u) { u = unproxy(u); if (!u || seen[u] || skip[u] || readerSrcs[u] || hostOf(u) !== host) return; seen[u] = 1; out.push(u); };
   if (doc) [].forEach.call(doc.images, function (im) { var w = +im.getAttribute('width'); if (!w || w >= 250) { var u = bestSrc(im); if (u) add(u); } });
@@ -506,8 +545,7 @@ function movePeek(x, ms) { if (!peek) return; peek.style.transition = ms ? 'tran
 // dir 1 = weiter (Inhalt geht nach links), -1 = zurück
 function slideTo(url, dir) {
   var p = pre[url], W = viewW();
-  if (dir > 0) { cur = 100; curA = null; dirty = true; }
-  save(true); asStop(true);
+  leaveChapter(); asStop(true);
   if (p && p.state === 'ok') {
     if (!peek || peek._dir !== dir) { makePeek(p, dir); peek.getBoundingClientRect(); }
     moveReader(-dir * W, 240); movePeek(0, 240);
@@ -551,7 +589,8 @@ function enterChapter() {
   var anc = e && e.i != null ? { i: e.i, f: e.f, n: e.n } : null;
   cur = target; curA = null; dirty = false; savedT = target; savedA = anc;
   pill.textContent = '📖 ' + cur + ' %';
-  if (target > 2 && target < 95) restore(target, anc); else onScroll();
+  if (target > 2 && target < 95) { fadeCover(true); restore(target, anc, { quiet: true, fast: true, done: function () { fadeCover(false); } }); }
+  else onScroll();
 }
 // Nach einem normalen Wechsel per Wischen: neues Kapitel von der Seite hereingleiten lassen
 function slideIn() {
@@ -688,13 +727,15 @@ function update() {
 }
 // Beim Öffnen an die letzte Stelle springen. Bilder laden nach, deshalb wird kurz nachjustiert,
 // bis die Position stabil ist oder du selbst scrollst.
-function restore(target, anc) {
-  if (!(target > 2 && target < 95)) return;
+// o.quiet: ohne Meldung, o.fast: schneller nachjustieren, o.done: wenn die Stelle steht
+function restore(target, anc, o) {
+  o = o || {};
+  if (!(target > 2 && target < 95)) { if (o.done) o.done(); return; }
   restoring = true; touched = false;
   var t0 = Date.now(), lastY = -1;
-  flash(L('↩ Springe zu ', '↩ Jumping to ') + target + ' %');
+  if (!o.quiet) flash(L('↩ Springe zu ', '↩ Jumping to ') + target + ' %');
   var iv = setInterval(function () {
-    var done = function () { clearInterval(iv); restoring = false; onScroll(); };
+    var done = function () { clearInterval(iv); restoring = false; onScroll(); if (o.done) o.done(); };
     if (touched || Date.now() - t0 > 15000) return done();
     var b = contentBox(); if (!b) return;
     var vh = window.innerHeight, y;
@@ -706,7 +747,7 @@ function restore(target, anc) {
     if (Math.abs(y - window.scrollY) > 8) window.scrollTo(0, y);
     else if (Math.abs(y - lastY) < 3) done();
     lastY = y;
-  }, 400);
+  }, o.fast ? 120 : 400);
 }
 ['touchstart', 'wheel', 'keydown', 'mousedown'].forEach(function (ev) {
   window.addEventListener(ev, function () { if (restoring) touched = true; }, { passive: true });
