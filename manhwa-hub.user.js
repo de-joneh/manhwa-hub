@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.16.0
+// @version      3.17.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.16.0';
+var VERSION = '3.17.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -562,7 +562,7 @@ function enrich(c, cb) {
           var u = absUrl(a.getAttribute('href'), c.url), n = chOf(u);
           if (n != null && pathOf(u).toLowerCase().indexOf(base) > -1) {
             if (e.ch == null || n > e.ch) { e.ch = n; e.chUrl = u; }
-            var dt = parseDate(a.textContent || '');
+            var dt = linkDate(a);
             if (dt && !rel[n]) rel[n] = dt;
             return;
           }
@@ -597,15 +597,74 @@ function badgeType(root) {
   }
   return '';
 }
-// Datum aus dem Text eines Kapitel-Links lesen, z. B. "October 3rd 2025", "Oct 3, 2025", "03.10.2025", "2025-10-03"
+// Datum aus dem Text eines Kapitel-Links lesen. Versteht absolute Angaben ("October 3rd 2025", "Oct 3, 2025",
+// "3. Oktober 2025", "03.10.2025", "2025-10-03", "Oct 3"), relative ("5 days ago", "vor 2 Stunden", "yesterday")
+// und <time datetime>. Ergebnis ist der Tag (12 Uhr), damit sich der Wert innerhalb eines Tages nicht ändert.
+var MON = { jan: 0, feb: 1, mar: 2, 'mär': 2, mae: 2, apr: 3, may: 4, mai: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, okt: 9, nov: 10, dec: 11, dez: 11 };
+var UNIT = [[/^(s|sec|secs|second|seconds|sek|sekunde|sekunden)$/, 1e3], [/^(m|min|mins|minute|minutes|minuten)$/, 6e4], [/^(h|hr|hrs|hour|hours|std|stunde|stunden)$/, 36e5],
+  [/^(d|day|days|tag|tage|tagen)$/, 864e5], [/^(w|wk|wks|week|weeks|woche|wochen)$/, 6048e5], [/^(mo|mon|mons|month|months|monat|monate|monaten)$/, 2592e6], [/^(y|yr|yrs|year|years|jahr|jahre|jahren)$/, 31536e6]];
+function unitMs(u) { for (var i = 0; i < UNIT.length; i++) if (UNIT[i][0].test(u)) return UNIT[i][1]; return 0; }
+function dayOf(t) { var d = new Date(t); d.setHours(12, 0, 0, 0); return d.getTime(); }
 function parseDate(txt) {
-  txt = txt.replace(/\s+/g, ' ');
-  var m = txt.match(/(\d{1,2})\.(\d{1,2})\.(\d{4})/), t = NaN;
-  if (m) t = new Date(+m[3], +m[2] - 1, +m[1]).getTime();
+  txt = String(txt || '').replace(/\s+/g, ' ').trim();
+  var low = txt.toLowerCase(), now = Date.now(), t = NaN, m, mi;
+  var num = function (x) { return /^\d+$/.test(x) ? +x : 1; };
+  if ((m = low.match(/(\d+|an?|one)\s*([a-z]+)\s+ago\b/)) && unitMs(m[2])) t = now - num(m[1]) * unitMs(m[2]);
+  else if ((m = low.match(/\bvor\s+(\d+|eine[rmn]?)\s+([a-zä]+)/)) && unitMs(m[2])) t = now - num(m[1]) * unitMs(m[2]);
+  else if (/\b(today|just now|heute|gerade eben)\b/.test(low)) t = now;
+  else if (/\b(yesterday|gestern)\b/.test(low)) t = now - 864e5;
+  else if ((m = txt.match(/(\d{1,2})\.(\d{1,2})\.(\d{4})/))) t = new Date(+m[3], +m[2] - 1, +m[1]).getTime();
   else if ((m = txt.match(/(\d{4})-(\d{2})-(\d{2})/))) t = new Date(+m[1], +m[2] - 1, +m[3]).getTime();
-  else if ((m = txt.match(/([A-Za-z]{3,9})\.? (\d{1,2})(?:st|nd|rd|th)?,? (\d{4})/))) t = Date.parse(m[1] + ' ' + m[2] + ', ' + m[3]);
-  if (isNaN(t) || t > Date.now() + 864e5 || t < Date.now() - 4 * 365 * 864e5) return 0;
+  else if ((m = low.match(/([a-zä]{3,9})\.? (\d{1,2})(?:st|nd|rd|th)?,? (\d{4})/)) && (mi = MON[m[1].slice(0, 3)]) != null) t = new Date(+m[3], mi, +m[2]).getTime();
+  else if ((m = low.match(/(\d{1,2})\.? ([a-zä]{3,9})\.?,? (\d{4})/)) && (mi = MON[m[2].slice(0, 3)]) != null) t = new Date(+m[3], mi, +m[1]).getTime();
+  else if ((m = low.match(/\b([a-zä]{3,9})\.? (\d{1,2})(?:st|nd|rd|th)?\b/)) && (mi = MON[m[1].slice(0, 3)]) != null && +m[2] <= 31) {
+    // Ohne Jahr: dieses Jahr, liegt das in der Zukunft, dann letztes
+    var y = new Date().getFullYear(); t = new Date(y, mi, +m[2]).getTime(); if (t > now + 864e5) t = new Date(y - 1, mi, +m[2]).getTime();
+  }
+  if (isNaN(t) || t > now + 864e5 || t < now - 4 * 365 * 864e5) return 0;
+  return dayOf(t);
+}
+function timeAttr(el) {
+  var tm = el.getAttribute && el.getAttribute('datetime') ? el : (el.querySelector && el.querySelector('time[datetime]'));
+  var t = tm ? Date.parse(tm.getAttribute('datetime')) : NaN;
+  return isNaN(t) || t > Date.now() + 864e5 ? 0 : dayOf(t);
+}
+// Text eines Elements mit Leerzeichen zwischen den Teilen: sonst wird aus "Chapter 32" + "5 days ago" "Chapter 325 days ago"
+function textOf(el) {
+  var out = [], w = (el.ownerDocument || document).createTreeWalker(el, 4), n;
+  while ((n = w.nextNode())) out.push(n.nodeValue);
+  return out.join(' ');
+}
+// Datum zu einem Kapitel-Link: im Link selbst, sonst im umgebenden Element, wenn dort nur dieser eine Link steht
+function linkDate(a) {
+  var t = timeAttr(a) || parseDate(textOf(a));
+  for (var el = a.parentElement, i = 0; !t && el && i < 3; el = el.parentElement, i++) {
+    if (el.querySelectorAll('a[href]').length > 1) break;
+    t = timeAttr(el) || parseDate(textOf(el));
+  }
   return t;
+}
+// Auf der Serienseite: Kapitel und Daten aus der angezeigten Seite neu lesen und an den Hub geben
+var relDoneFor = '';
+function refreshRel() {
+  if (relDoneFor === path || isChapter() || !SERIES.test(path)) return;
+  var self = (location.origin + path).replace(/\/$/, ''), base = slugBase(self), rel = {}, mx = null, mxU = null;
+  document.querySelectorAll('a[href]').forEach(function (a) {
+    var u = absUrl(a.getAttribute('href')), n = chOf(u);
+    if (n == null || pathOf(u).toLowerCase().indexOf(base) < 0) return;
+    if (mx == null || n > mx) { mx = n; mxU = u; }
+    var dt = linkDate(a); if (dt && !rel[n]) rel[n] = dt;
+  });
+  if (mx == null) return;
+  var all = get(DISC), e = all[self]; if (!e) return; // Erster Besuch: der Eintrag entsteht gerade beim Entdecken
+  var list = Object.keys(rel).map(function (n) { return [parseFloat(n), rel[n]]; }).sort(function (a, b) { return a[0] - b[0]; }).slice(-20);
+  var sig = JSON.stringify([list, mx]);
+  relDoneFor = path;
+  if (e.relSig === sig) return;
+  if (list.length) e.rel = list;
+  if (mx > (e.ch || 0)) { e.ch = mx; e.chUrl = mxU; }
+  e.relSig = sig; e.ack = false; e.t = Date.now();
+  put(DISC, keep(all, 150));
 }
 function runDisc() {
   discBusy = true;
@@ -803,7 +862,7 @@ if (typeof GM_registerMenuCommand === 'function') {
   GM_registerMenuCommand('Stand kopieren', copyAll);
   GM_registerMenuCommand('Cover dieser Seite merken', function () { grabCover(true); });
 }
-setInterval(function () { route(); if (isChapter()) onScroll(); else seriesCard(); }, 1200);
+setInterval(function () { route(); if (isChapter()) onScroll(); else { seriesCard(); refreshRel(); } }, 1200);
 route();
 if (!isChapter()) flash('📖 Manhwa Hub aktiv');
 
