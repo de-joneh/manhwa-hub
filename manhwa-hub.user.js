@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.28.0
+// @version      3.29.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.28.0';
+var VERSION = '3.29.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -45,7 +45,7 @@ var hubWin = isHub ? window : null;
 function post(m) { if (hubWin) { try { hubWin.postMessage(m, '*'); } catch (e) {} } }
 function token(forClipboard) {
   var l = get(LOG), cv = get(COV);
-  var p = Object.keys(l).map(function (k) { return { url: k, pct: l[k].pct, t: l[k].t, site: l[k].site || 0 }; });
+  var p = Object.keys(l).map(function (k) { return { url: k, pct: l[k].pct, t: l[k].t, site: l[k].site || 0, d: l[k].d || 0 }; });
   var c = Object.keys(cv).filter(function (k) { return !cv[k].ack && (!forClipboard || (cv[k].sent || 0) < 2); })
     .map(function (k) { return { url: k, img: cv[k].img, title: cv[k].title }; });
   var dd = get(DISC), d = Object.keys(dd).filter(function (k) { return !dd[k].ack; }).slice(0, forClipboard ? 30 : 150)
@@ -109,6 +109,82 @@ if (isHub || topMode) {
       });
     })();
   };
+  // Serie auf anderen Scan-Seiten suchen (MHUB-FIND): Suchseite abrufen, Treffer mit dem passendsten Titel wählen,
+  // dessen Kapitel-Links an den Hub schicken. Nur eigene Hilfen: die Variablen der Scan-Seiten-Teile gibt es hier nicht.
+  var keyT = function (t) { return String(t || '').toLowerCase().replace(/&[a-z]+;/g, ' ').replace(/[^a-z0-9]+/g, ''); };
+  var wordsT = function (t) { return String(t || '').toLowerCase().split(/[^a-z0-9]+/).filter(function (w) { return w.length > 1; }); };
+  var titleScore = function (a, b) {
+    var ka = keyT(a), kb = keyT(b); if (!ka || !kb) return 0;
+    if (ka === kb) return 1;
+    if (Math.min(ka.length, kb.length) >= 8 && (ka.indexOf(kb) > -1 || kb.indexOf(ka) > -1)) return 0.9;
+    var wa = wordsT(a), wb = wordsT(b), hit = wa.filter(function (w) { return wb.indexOf(w) > -1; }).length;
+    return hit / Math.max(wa.length, wb.length, 1);
+  };
+  var CHN = /(?:chapter|chap|ch|episode|ep)[-_\/ .]?(\d+(?:[-_.]\d+)?)/i;
+  var SERP = /\/(?:series|manga|manhwa|manhua|comics?|title|webtoon)\/[^\/?#]+\/?$/i;
+  var hostOfU = function (u) { try { return new URL(u).hostname.replace(/^www\./, ''); } catch (e) { return ''; } };
+  var absU = function (h, base) { try { var u = new URL(h, base); return u.origin + u.pathname; } catch (e) { return ''; } };
+  // Links auf Serienseiten derselben Seite, mit allen Namen, die dabei stehen (Linktext, title, Bild-alt)
+  var seriesHits = function (doc, base, host) {
+    var out = {};
+    [].forEach.call(doc.querySelectorAll('a[href]'), function (a) {
+      var u = absU(a.getAttribute('href'), base); if (!u || hostOfU(u) !== host) return;
+      var p = new URL(u).pathname; if (!SERP.test(p) || CHN.test(p)) return;
+      u = u.replace(/\/$/, '');
+      var img = a.querySelector('img'), names = [a.getAttribute('title'), (a.textContent || '').replace(/\s+/g, ' ').trim(), img && img.getAttribute('alt')];
+      out[u] = (out[u] || []).concat(names.filter(function (x) { return x && x.length < 200; }));
+    });
+    return out;
+  };
+  // Kapitel-Links einer Serienseite: Links (und Adressen im Seitentext) mit Kapitelnummer, die zur Serie gehören
+  var chaptersOf = function (html, page) {
+    var doc = new DOMParser().parseFromString(html, 'text/html'), host = hostOfU(page), ppath = new URL(page).pathname.replace(/\/$/, '');
+    var slug = ppath.split('/').pop().toLowerCase().replace(/-[a-z0-9]{8}$/, function (m) { return /\d/.test(m) ? '' : m; });
+    var found = {}, add = function (u) {
+      if (!u || hostOfU(u) !== host) return;
+      var p = new URL(u).pathname.toLowerCase(), m = p.match(CHN);
+      if (!m || (p.indexOf(ppath.toLowerCase() + '/') !== 0 && p.indexOf(slug) < 0)) return;
+      var n = parseFloat(m[1].replace(/[-_]/, '.'));
+      if (!isNaN(n) && n < 100000 && !found[n]) found[n] = u;
+    };
+    [].forEach.call(doc.querySelectorAll('a[href]'), function (a) { add(absU(a.getAttribute('href'), page)); });
+    var t = html.replace(/\\+\//g, '/'), re = /(?:https?:\/\/[^"'\s<>\\]+)?\/[^"'\s<>\\]*(?:chapter|chap|ch|episode|ep)[-_\/ .]?\d+(?:[-_.]\d+)?\/?/gi, m;
+    while ((m = re.exec(t))) add(absU(m[0], page));
+    return Object.keys(found).map(function (n) { return [+n, found[n]]; }).sort(function (a, b) { return a[0] - b[0]; });
+  };
+  var findOn = function (titles, site, cb) {
+    var q = encodeURIComponent(titles[0]), urls = [site.origin + '/?s=' + q, site.origin + '/series?name=' + q, site.origin + '/search?q=' + q], i = 0;
+    (function step() {
+      if (i >= urls.length) return cb(null);
+      var su = urls[i++];
+      fetchText(su, function (html) {
+        if (!html) return step();
+        var hits = seriesHits(new DOMParser().parseFromString(html, 'text/html'), su, site.host), best = null;
+        Object.keys(hits).forEach(function (u) {
+          var sc = 0, slugName = u.split('/').pop().replace(/-[a-z0-9]{8}$/, '').replace(/[-_]+/g, ' ');
+          hits[u].concat([slugName]).forEach(function (nm) { titles.forEach(function (t) { sc = Math.max(sc, titleScore(nm, t)); }); });
+          if (sc >= 0.6 && (!best || sc > best.sc)) best = { u: u, sc: sc, name: hits[u][0] || slugName };
+        });
+        if (!best) return step();
+        fetchText(best.u, function (page) {
+          var ch = page ? chaptersOf(page, best.u) : [];
+          cb(ch.length ? { page: best.u, title: best.name, ch: ch.slice(-3000) } : null);
+        });
+      });
+    })();
+  };
+  var runFind = function (o) {
+    if (!o || !Array.isArray(o.sites) || !Array.isArray(o.titles) || !o.titles.length) return;
+    var i = 0, found = 0;
+    (function next() {
+      if (i >= o.sites.length) { post('MHUB-FINDEND:' + JSON.stringify({ id: o.id, found: found })); return; }
+      var site = o.sites[i++];
+      findOn(o.titles, site, function (r) {
+        if (r) { found++; post('MHUB-SRCFOUND:' + JSON.stringify({ id: o.id, host: site.host, page: r.page, title: r.title, ch: r.ch })); }
+        setTimeout(next, 700);
+      });
+    })();
+  };
   window.addEventListener('message', function (e) {
     if (typeof e.data !== 'string' || e.data.indexOf('MHUB') !== 0) return;
     if (isHub ? e.origin !== location.origin : (!e.source || e.source === window)) return;
@@ -137,6 +213,7 @@ if (isHub || topMode) {
       } catch (err) {}
     }
     else if (d.indexOf('MHUB-CHECK:') === 0) { try { runCheck(JSON.parse(d.slice(11))); } catch (err) {} }
+    else if (d.indexOf('MHUB-FIND:') === 0) { try { runFind(JSON.parse(d.slice(10))); } catch (err) {} }
     else if (d.indexOf('MHUB-IMG:') === 0) {
       try { var o = JSON.parse(d.slice(9)); shrink(o.url, 360, 480, function (img) { post('MHUB-IMGOK:' + JSON.stringify({ id: o.id, img: img })); }); } catch (err) {}
     }
@@ -330,12 +407,13 @@ function buildReader() {
   readerStyle = document.createElement('style');
   readerStyle.textContent = 'html,body{background:#000!important;overflow-x:hidden!important;overflow-y:auto!important;margin:0!important}' +
     'body>*:not(#mhub-reader):not(#mhub-dock):not(#mhub-nav):not(#mhub-peek):not(#mhub-fade){display:none!important}' +
-    '#mhub-nav{display:flex!important;gap:8px;max-width:820px;margin:0 auto;padding:18px 12px 120px;background:#000;font:700 15px system-ui,sans-serif}' +
+    '#mhub-nav{display:flex!important;gap:8px;max-width:var(--mhub-w,820px);margin:0 auto;padding:18px 12px 120px;background:#000;font:700 15px system-ui,sans-serif}' +
     '#mhub-nav a{flex:1;display:flex;align-items:center;justify-content:center;min-height:52px;border-radius:12px;background:#2a2639;color:#ece9f6;text-decoration:none;text-align:center;padding:0 10px}' +
     '#mhub-nav a.nx{background:#913fe2;color:#fff;flex:1.4}#mhub-nav span{flex:1.4;display:flex;align-items:center;justify-content:center;color:#9893b0}' +
     // pan-y: der Browser scrollt senkrecht selbst und muss nie auf das Skript warten; waagerecht gehört dem Wischen
     '#mhub-reader{display:block!important;background:#000;padding:0;margin:0;touch-action:pan-y pinch-zoom}' +
-    '#mhub-reader img{display:block;width:100%;max-width:820px;height:auto;margin:0 auto;border:0}';
+    '#mhub-reader img{display:block;width:100%;max-width:var(--mhub-w,820px);height:auto;margin:0 auto;border:0}';
+  applyWidth();
   (document.head || document.documentElement).appendChild(readerStyle);
   document.body.appendChild(reader);
   readerNav = chapterNav(); if (readerNav) document.body.appendChild(readerNav);
@@ -438,7 +516,12 @@ function prepareReader(cb) {
 var DESK = !!(window.matchMedia && matchMedia('(pointer: fine)').matches);
 function prefs() {
   var p = {}; try { p = JSON.parse(GM_getValue('mhub_prefs', '{}')) || {}; } catch (e) {}
-  return { auto: p.auto || 'key', speed: p.speed || 2, wheel: +p.wheel || 1, click: p.click !== false, swipe: p.swipe !== false, preload: p.preload !== false };
+  return { auto: p.auto || 'key', speed: p.speed || 2, wheel: +p.wheel || 1, click: p.click !== false, swipe: p.swipe !== false, preload: p.preload !== false, width: +p.width || 820 };
+}
+// Bildbreite im Modus „Nur Bilder“ (Regler im Hub). 1600 heißt: volle Breite
+function applyWidth() {
+  var w = prefs().width;
+  document.documentElement.style.setProperty('--mhub-w', w >= 1600 ? '100%' : w + 'px');
 }
 var AS_SPEEDS = [0, 30, 55, 85, 120, 170, 240, 330], asOn = false, asLevel = 2, asLast = 0, asAcc = 0, asPill = null, asPillT = 0;
 function asShow(text) {
@@ -603,7 +686,7 @@ function makePeek(p, dir) {
   var a = ancFor(p.url, p.imgs), from = a ? Math.max(0, a.i - 1) : 0, inner = document.createElement('div'), els = [];
   inner.style.cssText = 'position:absolute;left:0;right:0;top:0';
   // Synchron zeichnen: sonst lässt der Browser die Bilder beim Springen der Seite darunter ein Bild lang weg (schwarz)
-  p.imgs.slice(from, from + 4).forEach(function (src) { var i = new Image(); i.decoding = 'sync'; i.src = src; i.alt = ''; i.style.cssText = 'display:block;width:100%;max-width:820px;height:auto;margin:0 auto'; if (i.decode) i.decode().catch(function () {}); inner.appendChild(i); els.push(i); });
+  p.imgs.slice(from, from + 4).forEach(function (src) { var i = new Image(); i.decoding = 'sync'; i.src = src; i.alt = ''; i.style.cssText = 'display:block;width:100%;max-width:var(--mhub-w,820px);height:auto;margin:0 auto'; if (i.decode) i.decode().catch(function () {}); inner.appendChild(i); els.push(i); });
   d.appendChild(inner);
   document.body.appendChild(d);
   // Wie restore(): Bild a.i, Anteil a.f liegt auf der Linie bei 30 % der Bildschirmhöhe
@@ -698,6 +781,7 @@ function swapChapter(url, p, dir, swiped) {
 // Stand des (neuen) Kapitels laden und an die gespeicherte Stelle springen
 function enterChapter() {
   var sp = savedSpot(), target = sp.pct, anc = sp.anc;
+  startTiming(sp.e);
   cur = target; curA = null; dirty = false; savedT = target; savedA = anc;
   pill.textContent = '📖 ' + cur + ' %';
   if (target > 2 && target < 95) {
@@ -822,11 +906,21 @@ function trackAct() {
   actScroll += Math.abs(window.scrollY - actY); actY = window.scrollY;
   if (actScroll > window.innerHeight * 0.8) { visitAct = true; dirty = true; }
 }
+// Aktive Lesezeit im Kapitel (d, in ms) für die Restzeit im Hub: Zeit zwischen Scroll-Bewegungen, Pausen über 45 s zählen nicht
+var readMs = 0, readT = 0;
+function startTiming(prev) { readMs = (prev && prev.d) || 0; readT = 0; }
+function tickRead() {
+  if (restoring || !isChapter()) return;
+  var now = Date.now();
+  if (readT && now - readT < 45000) readMs += now - readT;
+  readT = now;
+}
 function save(force) {
   if (!dirty || !visitAct) return;
   var now = Date.now(); if (!force && now - lastWrite < 2000) return;
   var l = get(LOG), en = { pct: cur, t: now };
   if (curA) { en.i = curA.i; en.f = curA.f; en.n = curA.n; }
+  if (readMs) en.d = Math.round(readMs);
   l[location.origin + path] = en;
   put(LOG, keep(l, 60)); lastWrite = now; dirty = false;
 }
@@ -1330,6 +1424,7 @@ function route() {
 // Kapitelseite: Stand laden, Lesemodus aufbauen, an die Stelle springen
 function openChapter() {
   var sp = savedSpot(), target = sp.pct, anc = sp.anc;
+  startTiming(sp.e);
   var hm = location.hash.match(/mhub-(\d{1,3})/);
   if (hm) {
     // Kommt der Stand von einem anderen Gerät, passt der lokale Anker nicht mehr
@@ -1371,7 +1466,7 @@ function openPage() {
 }
 
 window.addEventListener('scroll', function () {
-  trackAct();
+  trackAct(); tickRead();
   onScroll();
   if (!isChapter()) { clearTimeout(discT); discT = setTimeout(discover, 2000); }
 }, { passive: true });
@@ -1381,6 +1476,8 @@ if (typeof GM_registerMenuCommand === 'function') {
   GM_registerMenuCommand(L('Stand kopieren', 'Copy progress'), copyAll);
   GM_registerMenuCommand(L('Cover dieser Seite merken', 'Save cover of this page'), function () { grabCover(true); });
 }
+// Lese-Einstellungen sofort übernehmen, auch in schon offenen Kapiteln (Bildbreite)
+if (GM_addValueChangeListener) GM_addValueChangeListener('mhub_prefs', function () { if (reader) applyWidth(); });
 setInterval(function () { route(); if (isChapter()) onScroll(); else { seriesCard(); refreshRel(); } }, 1200);
 route();
 if (!isChapter()) flash(L('📖 Manhwa Hub aktiv', '📖 Manhwa Hub active'));
