@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.21.0
+// @version      3.22.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.21.0';
+var VERSION = '3.22.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -228,7 +228,7 @@ function toggleMode() {
 }
 cleanBtn.addEventListener('click', toggleMode);
 dock.appendChild(pill); dock.appendChild(cleanBtn); dock.appendChild(homeBtn);
-// In Kapiteln ist die Leiste versteckt. Doppeltipp wechselt direkt zwischen Original und „Nur Bilder“.
+// In Kapiteln ist die Leiste versteckt. Ein Tipp blendet sie ein und aus, ein Doppeltipp wechselt zwischen Original und „Nur Bilder“.
 var dockT = 0;
 function showDock(ms, force) {
   if (!force && Date.now() < quietUntil) return;
@@ -237,14 +237,23 @@ function showDock(ms, force) {
   if (isChapter()) dockT = setTimeout(hideDock, ms || 3000);
 }
 function hideDock() { if (!isChapter()) return; dock.style.opacity = '0'; dock.style.pointerEvents = 'none'; }
-var lastTap = 0, tapX = 0, tapY = 0, tapMoved = false;
+var lastTap = 0, tapX = 0, tapY = 0, tapMoved = false, singleT = 0;
+function dockShown() { return dock.style.opacity !== '0'; }
+// Tipps auf Links und Knöpfe der Seite gehören der Seite
+function pageControl(el) { return el && el.closest && el.closest('a,button,input,textarea,select,label,[role="button"],[onclick]') && !(reader && reader.contains(el)); }
 window.addEventListener('touchstart', function () { tapMoved = false; }, { passive: true, capture: true });
 window.addEventListener('touchmove', function () { tapMoved = true; }, { passive: true, capture: true });
 window.addEventListener('touchend', function (e) {
   if (!isChapter() || tapMoved || e.touches.length || dock.contains(e.target)) return;
   var t = e.changedTouches[0], now = Date.now();
-  if (now - lastTap < 350 && Math.abs(t.clientX - tapX) < 40 && Math.abs(t.clientY - tapY) < 40) { lastTap = 0; toggleMode(); }
-  else { lastTap = now; tapX = t.clientX; tapY = t.clientY; }
+  if (now - lastTap < 350 && Math.abs(t.clientX - tapX) < 40 && Math.abs(t.clientY - tapY) < 40) { lastTap = 0; clearTimeout(singleT); toggleMode(); }
+  else {
+    lastTap = now; tapX = t.clientX; tapY = t.clientY;
+    if (pageControl(e.target)) return;
+    // Einfacher Tipp: kurz abwarten, ob ein zweiter folgt, dann Leiste ein- oder ausblenden
+    clearTimeout(singleT);
+    singleT = setTimeout(function () { if (!isChapter() || switching) return; if (dockShown()) { clearTimeout(dockT); hideDock(); } else showDock(3000, true); }, 360);
+  }
 }, { passive: true, capture: true });
 window.addEventListener('dblclick', function (e) { if (isChapter() && !dock.contains(e.target)) toggleMode(); }, true);
 dock.addEventListener('click', function () { if (isChapter()) showDock(3000, true); }, true);
@@ -470,6 +479,10 @@ if (DESK) {
       window.scrollBy({ top: (up ? -1 : 1) * window.innerHeight * 0.85, behavior: 'smooth' });
     }, 260);
   }, true);
+  window.addEventListener('mousemove', function (e) {
+    if (!isChapter() || e.clientX < window.innerWidth - 220 || e.clientY < window.innerHeight - 140) return;
+    if (!dockShown()) showDock(2500, true); else { clearTimeout(dockT); dockT = setTimeout(hideDock, 2500); }
+  }, { passive: true });
   window.addEventListener('keydown', function (e) {
     if (!isChapter() || typing(e) || e.ctrlKey || e.metaKey || e.altKey) return;
     var k = e.key, p = prefs();
