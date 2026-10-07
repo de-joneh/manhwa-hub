@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.25.1
+// @version      3.26.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.25.1';
+var VERSION = '3.26.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -179,9 +179,13 @@ var homeBtn = document.createElement('div');
 homeBtn.setAttribute('role', 'button'); homeBtn.setAttribute('aria-label', L('Zurück zum Manhwa Hub', 'Back to Manhwa Hub'));
 homeBtn.style.cssText = 'display:flex;align-items:center;gap:5px;background:#17121f;color:#fff;padding:9px 12px;border-radius:999px;box-shadow:0 3px 12px rgba(0,0,0,.45);cursor:pointer;border:1px solid #913fe2';
 homeBtn.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#ab6bf0" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11l9-7 9 7"/><path d="M5 10v10h14V10"/></svg><span>Hub</span>';
+// Zurück zum Hub: Kapitel öffnet der Hub in einem neuen Tab, der Hub-Tab ist also noch offen.
+// Darum zuerst diesen Tab schließen (kein Neuladen, kein Wechsel in die Claude-App). Erlaubt Firefox das nicht, die Hub-Adresse aufrufen.
 homeBtn.addEventListener('click', function () {
   save(true);
-  location.href = GM_getValue('mhub_home', '') || HUB_DEFAULT;
+  var home = GM_getValue('mhub_home', '') || HUB_DEFAULT;
+  try { window.close(); } catch (e) {}
+  setTimeout(function () { location.href = home; }, 250);
 });
 dock.id = 'mhub-dock';
 var cleanBtn = document.createElement('div');
@@ -659,7 +663,8 @@ function swapChapter(url, p, dir) {
   });
   // Erst den eigenen Pfad setzen, dann die Adresse: so baut route() nichts neu auf
   inlineNav = true; path = u.pathname; curDoc = p.doc;
-  try { history.pushState({ mhub: 1 }, '', u.pathname + u.search); } catch (e) { location.href = url; return; }
+  // Adresse ersetzen statt neuen Verlaufseintrag: der Tab bleibt schließbar (Hub-Knopf), Zurück führt direkt zum Hub
+  try { history.replaceState({ mhub: 1 }, '', u.pathname + u.search); } catch (e) { location.href = url; return; }
   if (p.doc && p.doc.title) document.title = p.doc.title;
   box = null; imgCount = -1; bigImgs = [];
   window.scrollTo(0, 0);
