@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.18.0
+// @version      3.19.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.18.0';
+var VERSION = '3.19.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -116,6 +116,7 @@ if (isHub || topMode) {
     if (topMode && hubWin !== e.source) { hubWin = e.source; post('MHUB-CORE:' + VERSION); GM_setValue('mhub_home', location.origin + location.pathname); }
     if (d === 'MHUB-HELLO') send();
     else if (d.indexOf('MHUB-LANG:') === 0) GM_setValue('mhub_lang', d.slice(10) === 'en' ? 'en' : 'de');
+    else if (d.indexOf('MHUB-PREFS:') === 0) GM_setValue('mhub_prefs', d.slice(11));
     else if (d.indexOf('MHUB-SITES:') === 0) {
       try { var list = JSON.parse(d.slice(11)); if (Array.isArray(list)) GM_setValue('mhub_sites', JSON.stringify(list)); } catch (err) {}
       post('MHUB-SITES-OK');
@@ -324,7 +325,8 @@ function teardownReader() {
 // Knöpfe am Kapitelende im Lesemodus: vorheriges Kapitel, Serienseite, nächstes Kapitel.
 // Links stammen von der Seite selbst; fehlt einer, wird er gebaut, wenn der Hub das Kapitel kennt.
 var CHPART = /((?:chapter|chap|ch|episode|ep)[-_\/ .]?)(\d+(?:[-_.]\d+)?)/i;
-function chapterNav() {
+// Vorheriges/nächstes Kapitel und Serienseite. Links stammen von der Seite; fehlt einer, wird er gebaut, wenn der Hub das Kapitel kennt
+function chapterTargets() {
   var m = path.match(CHPART); if (!m) return null;
   var n = parseFloat(m[2].replace(/[-_]/, '.')), head = path.slice(0, m.index), strip = function (p) { return p.toLowerCase().replace(CHPART, '#'); };
   var found = {}, me = strip(path);
@@ -339,11 +341,18 @@ function chapterNav() {
   var prev = found[prevN] || (prevN >= 1 ? make(prevN) : '');
   var next = found[nextN] || (e && e.m >= nextN ? make(nextN) : '');
   var home = head.replace(/[-_\/]+$/, ''), homeUrl = isSeriesUrl(location.origin + home) ? location.origin + home : '';
+  return { prev: prev, prevN: prevN, next: next, nextN: nextN, homeUrl: homeUrl };
+}
+// Als gelesen speichern und zum nächsten Kapitel
+function goNext(url) { cur = 100; curA = null; dirty = true; save(true); location.href = url; }
+function chapterNav() {
+  var t = chapterTargets(); if (!t) return null;
+  var prev = t.prev, prevN = t.prevN, next = t.next, nextN = t.nextN, homeUrl = t.homeUrl;
   var nav = document.createElement('div'); nav.id = 'mhub-nav';
   var link = function (href, text, cls) {
     var a = document.createElement('a'); a.href = href; a.textContent = text; if (cls) a.className = cls;
     // Nächstes Kapitel: dieses als fertig gelesen speichern
-    if (cls === 'nx') a.addEventListener('click', function () { cur = 100; curA = null; dirty = true; save(true); });
+    if (cls === 'nx') a.addEventListener('click', function (ev) { ev.preventDefault(); goNext(href); });
     else a.addEventListener('click', function () { save(true); });
     nav.appendChild(a);
   };
@@ -354,6 +363,87 @@ function chapterNav() {
   // Klicks nicht an die Seite weitergeben (Werbe-Fenster)
   nav.addEventListener('click', function (ev) { ev.stopPropagation(); });
   return nav;
+}
+/* ---------- Lesen am PC: Auto-Scroll, Klick blättert, Mausrad-Tempo, Tasten ----------
+   Einstellungen kommen vom Hub (MHUB-PREFS, gespeichert als mhub_prefs). Nur mit Maus (pointer: fine), am Handy bleibt alles wie es ist. */
+var DESK = !!(window.matchMedia && matchMedia('(pointer: fine)').matches);
+function prefs() {
+  var p = {}; try { p = JSON.parse(GM_getValue('mhub_prefs', '{}')) || {}; } catch (e) {}
+  return { auto: p.auto || 'key', speed: p.speed || 2, wheel: +p.wheel || 1, click: p.click !== false };
+}
+var AS_SPEEDS = [0, 30, 55, 85, 120, 170, 240, 330], asOn = false, asLevel = 2, asLast = 0, asAcc = 0, asPill = null, asPillT = 0;
+function asShow(text) {
+  if (!asPill) {
+    asPill = document.createElement('div'); asPill.id = 'mhub-as';
+    asPill.style.cssText = 'position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:2147483647;background:rgba(23,18,31,.92);color:#fff;border:1px solid #913fe2;' +
+      'padding:7px 14px;border-radius:999px;font:600 13px system-ui,sans-serif;pointer-events:none;transition:opacity .3s';
+    document.body.appendChild(asPill);
+  }
+  asPill.textContent = text; asPill.style.opacity = '1';
+  clearTimeout(asPillT); asPillT = setTimeout(function () { if (asPill) asPill.style.opacity = '0'; }, 1600);
+}
+function asTick(t) {
+  if (!asOn) return;
+  var dt = Math.min(64, t - asLast); asLast = t;
+  asAcc += AS_SPEEDS[asLevel] * dt / 1000;
+  var px = Math.floor(asAcc);
+  if (px) { window.scrollBy(0, px); asAcc -= px; }
+  if (window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2) { asStop(); asShow(L('Kapitelende', 'End of chapter')); return; }
+  requestAnimationFrame(asTick);
+}
+function asStart() {
+  if (asOn || !isChapter()) return;
+  asOn = true; asLast = performance.now(); asAcc = 0;
+  asShow('▶ ' + L('Auto-Scroll', 'Auto-scroll') + ' · ' + asLevel + '/7');
+  requestAnimationFrame(asTick);
+}
+function asStop(quiet) { if (!asOn) return; asOn = false; if (!quiet) asShow('❚❚ ' + L('Pause', 'Paused')); }
+function asSpeed(d) {
+  asLevel = Math.max(0, Math.min(7, asLevel + d));
+  if (!asLevel) { asLevel = 1; asStop(); return; }
+  asShow('▶ ' + L('Tempo ', 'Speed ') + asLevel + '/7');
+}
+function autoStartWhenReady(myPath) {
+  if (path !== myPath || !isChapter()) return;
+  if (restoring || preparing) return setTimeout(function () { autoStartWhenReady(myPath); }, 500);
+  setTimeout(function () { if (path === myPath) asStart(); }, 800);
+}
+var typing = function (e) { var t = e.target; return t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)); };
+var ours = function (el) { return el && el.closest && el.closest('#mhub-dock,#mhub-nav,#mhub-card,a,button,input,textarea,select,label'); };
+if (DESK) {
+  // Mausrad: während Auto-Scroll regelt es das Tempo, sonst scrollt es auf Wunsch weiter als normal
+  window.addEventListener('wheel', function (e) {
+    if (!isChapter() || e.ctrlKey) return;
+    if (asOn) { e.preventDefault(); asSpeed(e.deltaY > 0 ? 1 : -1); return; }
+    var f = prefs().wheel; if (f === 1) return;
+    e.preventDefault();
+    var k = e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? window.innerHeight : 1;
+    window.scrollBy(0, e.deltaY * k * f);
+  }, { passive: false });
+  // Klick blättert eine Bildschirmseite weiter, oberes Viertel zurück. Kurz warten, damit ein Doppelklick (Moduswechsel) nicht vorher blättert
+  var clickT = 0;
+  window.addEventListener('click', function (e) {
+    if (!isChapter() || e.button !== 0 || ours(e.target) || !prefs().click) return;
+    if (String(window.getSelection ? window.getSelection() : '').length) return;
+    if (clickT) { clearTimeout(clickT); clickT = 0; return; }
+    var up = e.clientY < window.innerHeight * 0.25;
+    clickT = setTimeout(function () {
+      clickT = 0;
+      if (asOn) { asStop(); return; }
+      window.scrollBy({ top: (up ? -1 : 1) * window.innerHeight * 0.85, behavior: 'smooth' });
+    }, 260);
+  }, true);
+  window.addEventListener('keydown', function (e) {
+    if (!isChapter() || typing(e) || e.ctrlKey || e.metaKey || e.altKey) return;
+    var k = e.key, p = prefs();
+    if ((k === 's' || k === 'S') && p.auto !== 'off') { e.preventDefault(); if (asOn) asStop(); else asStart(); }
+    else if (k === ' ' && asOn) { e.preventDefault(); asStop(); }
+    else if ((k === '+' || k === '=') && asOn) { e.preventDefault(); asSpeed(1); }
+    else if (k === '-' && asOn) { e.preventDefault(); asSpeed(-1); }
+    else if (k === 'ArrowRight' || k === 'n' || k === 'N') { var t = chapterTargets(); if (t && t.next) { e.preventDefault(); goNext(t.next); } else asShow(L('Neuestes Kapitel ✓', 'Latest chapter ✓')); }
+    else if (k === 'ArrowLeft' || k === 'p' || k === 'P') { var t2 = chapterTargets(); if (t2 && t2.prev) { e.preventDefault(); save(true); location.href = t2.prev; } }
+    else if (k === 'Escape' && asOn) asStop();
+  }, true);
 }
 function blockPopups() {
   var w = GM.uw; if (!w) return;
@@ -898,6 +988,7 @@ function route() {
   if (location.pathname === path) return;
   save(true);
   teardownReader();
+  asStop(true);
   path = location.pathname; box = null; imgCount = -1;
   if (card) { card.remove(); card = null; }
   if (CH.test(path.toLowerCase())) {
@@ -925,6 +1016,8 @@ function route() {
     prepareReader(function () {
       if (path !== myPath) return;
       if (target > 2 && target < 95) restore(target, anc); else onScroll();
+      asLevel = prefs().speed;
+      if (DESK && prefs().auto === 'start') autoStartWhenReady(myPath);
     });
   } else {
     pill.style.display = 'none'; cleanBtn.style.display = 'none';
