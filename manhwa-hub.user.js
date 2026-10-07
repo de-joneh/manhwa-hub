@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.26.1
+// @version      3.27.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.26.1';
+var VERSION = '3.27.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -618,7 +618,7 @@ function dropPeek() { if (peek && peek.parentNode) peek.parentNode.removeChild(p
 function movePeek(x, ms) { if (!peek) return; peek.style.transition = ms ? 'transform ' + ms + 'ms ease-out' : 'none'; peek.style.transform = 'translateX(' + x + 'px)'; }
 // dir 1 = weiter (Inhalt geht nach links), -1 = zurück
 var sliding = false;
-function slideTo(url, dir) {
+function slideTo(url, dir, swiped) {
   if (sliding) return;
   sliding = true;
   leaveChapter(); asStop(true);
@@ -630,18 +630,18 @@ function slideTo(url, dir) {
   }
   whenReady(url, 4000, function (p) {
     loadingHint(dir, false);
-    if (p) return doSlide(url, p, dir);
+    if (p) return doSlide(url, p, dir, swiped);
     // Bilder nicht zu finden: normal laden, mit Gleit-Animation
     dropPeek(); moveReader(-dir * viewW(), 200);
-    GM_setValue('mhub_slide', JSON.stringify({ d: dir, t: Date.now() }));
+    GM_setValue('mhub_slide', JSON.stringify({ d: dir, t: Date.now(), s: swiped ? 1 : 0 }));
     setTimeout(function () { location.href = url; }, 190);
   });
 }
-function doSlide(url, p, dir) {
+function doSlide(url, p, dir, swiped) {
   var W = viewW();
   if (!peek || peek._dir !== dir) { makePeek(p, dir); peek.getBoundingClientRect(); }
   moveReader(-dir * W, 240); movePeek(0, 240);
-  setTimeout(function () { swapChapter(url, p, dir); }, 250);
+  setTimeout(function () { swapChapter(url, p, dir, swiped); }, 250);
 }
 function loadingHint(dir, on) {
   if (!swHint) hint(dir > 0 ? -1 : 1, {});
@@ -651,9 +651,10 @@ function loadingHint(dir, on) {
   swHint.style.left = dir > 0 ? '' : '12px'; swHint.style.right = dir > 0 ? '12px' : '';
   swHint.style.background = '#913fe2'; swHint.style.opacity = '1'; swHint.style.display = 'block';
 }
-function swapChapter(url, p, dir) {
+function swapChapter(url, p, dir, swiped) {
   var u = new URL(url, location.href), a = ancFor(url, p.imgs);
   rememberCurrent();
+  visitAct = !swiped; actScroll = 0; actY = 0;
   if (readerObs) { readerObs.disconnect(); readerObs = null; }
   reader.innerHTML = ''; readerSrcs = {};
   p.imgs.forEach(function (src, k) {
@@ -692,6 +693,7 @@ function slideIn() {
   var sl = null; try { sl = JSON.parse(GM_getValue('mhub_slide', 'null')); } catch (e) {}
   if (!sl || Date.now() - sl.t > 15000 || !reader) return;
   GM_setValue('mhub_slide', 'null');
+  if (sl.s) { visitAct = false; actScroll = 0; actY = window.scrollY; }
   moveReader(sl.d * viewW(), 0);
   requestAnimationFrame(function () { requestAnimationFrame(function () { moveReader(0, 260); }); });
 }
@@ -733,7 +735,7 @@ function swipeEnd() {
   if (!sw0 || !sw0.h) { sw0 = null; return; }
   var dx = sw0.dx, url = dx < 0 ? sw0.tg.next : sw0.tg.prev; sw0 = null;
   if (swHint) swHint.style.display = 'none';
-  if (url && Math.abs(dx) > viewW() * 0.28) slideTo(url, dx < 0 ? 1 : -1);
+  if (url && Math.abs(dx) > viewW() * 0.28) slideTo(url, dx < 0 ? 1 : -1, true);
   else { moveReader(0, 200); if (peek) { movePeek(peek._dir * viewW(), 200); var pk = peek; peek = null; setTimeout(function () { if (pk.parentNode) pk.parentNode.removeChild(pk); }, 220); } }
 }
 window.addEventListener('touchend', swipeEnd, { passive: true, capture: true });
@@ -801,8 +803,15 @@ function measure() {
   var vh = window.innerHeight, y = window.scrollY;
   return Math.max(0, Math.min(100, Math.round((y + vh - b.top) / b.height * 100)));
 }
+// Per Wischen betretene Kapitel zählen erst, wenn du darin wirklich scrollst (visitAct). Sonst kein Stand, kein „angefangen“
+var visitAct = true, actScroll = 0, actY = 0;
+function trackAct() {
+  if (visitAct || restoring || !isChapter()) { actY = window.scrollY; return; }
+  actScroll += Math.abs(window.scrollY - actY); actY = window.scrollY;
+  if (actScroll > window.innerHeight * 0.8) { visitAct = true; dirty = true; }
+}
 function save(force) {
-  if (!dirty) return;
+  if (!dirty || !visitAct) return;
   var now = Date.now(); if (!force && now - lastWrite < 800) return;
   var l = get(LOG), en = { pct: cur, t: now };
   if (curA) { en.i = curA.i; en.f = curA.f; en.n = curA.n; }
@@ -1340,6 +1349,7 @@ pill.addEventListener('click', function () {
   else flash(savedT > 2 && savedT < 95 ? L('Du bist schon an deiner Stelle', 'You are already at your spot') : L('Noch keine gespeicherte Stelle', 'No saved spot yet'));
 });
 window.addEventListener('scroll', function () {
+  trackAct();
   onScroll();
   if (!isChapter()) { clearTimeout(discT); discT = setTimeout(discover, 2000); }
 }, { passive: true });
