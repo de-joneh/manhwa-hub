@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.13.0
+// @version      3.14.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,12 +23,12 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.13.0';
+var VERSION = '3.14.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
 var SERIES = /\/(?:series|manga|manhwa|manhua|comics?|title|webtoon|novels?)\/[^\/]+\/?$/;
-var LOG = 'mhub_log', COV = 'mhub_cov', DISC = 'mhub_disc';
+var LOG = 'mhub_log', COV = 'mhub_cov', DISC = 'mhub_disc', LIB = 'mhub_lib', ADD = 'mhub_add';
 
 function get(k) { try { return JSON.parse(GM_getValue(k, '{}')) || {}; } catch (e) { return {}; } }
 function put(k, v) { GM_setValue(k, JSON.stringify(v)); }
@@ -48,8 +48,9 @@ function token(forClipboard) {
     .map(function (k) { return { url: k, img: cv[k].img, title: cv[k].title }; });
   var dd = get(DISC), d = Object.keys(dd).filter(function (k) { return !dd[k].ack; }).slice(0, forClipboard ? 30 : 150)
     .map(function (k) { var e = dd[k]; return { url: k, title: e.title, rating: e.rating, ch: e.ch, chUrl: e.chUrl, img: e.img, site: e.site, g: e.g, desc: e.desc, type: e.type, rel: e.rel }; });
-  if (!p.length && !c.length && !d.length) return '';
-  return 'MHUB2:' + btoa(unescape(encodeURIComponent(JSON.stringify({ p: p, c: c, d: d }))));
+  var a = forClipboard ? [] : Object.keys(get(ADD));
+  if (!p.length && !c.length && !d.length && !a.length) return '';
+  return 'MHUB2:' + btoa(unescape(encodeURIComponent(JSON.stringify({ p: p, c: c, d: d, a: a }))));
 }
 
 /* ---------- Im Hub ---------- */
@@ -116,15 +117,18 @@ if (isHub || topMode) {
       try { var list = JSON.parse(d.slice(11)); if (Array.isArray(list)) GM_setValue('mhub_sites', JSON.stringify(list)); } catch (err) {}
       post('MHUB-SITES-OK');
     }
+    else if (d.indexOf('MHUB-LIB:') === 0) { GM_setValue(LIB, d.slice(9)); }
     else if (d.indexOf('MHUB-ACK:') === 0) {
       try {
-        var urls = JSON.parse(d.slice(9)), cv = get(COV), dv = get(DISC), ch = false, ch2 = false;
+        var urls = JSON.parse(d.slice(9)), cv = get(COV), dv = get(DISC), ad = get(ADD), ch = false, ch2 = false, ch3 = false;
         urls.forEach(function (u) {
           if (cv[u] && !cv[u].ack) { cv[u].ack = true; ch = true; }
           if (dv[u] && !dv[u].ack) { dv[u].ack = true; ch2 = true; }
+          if (ad[u]) { delete ad[u]; ch3 = true; }
         });
         if (ch) put(COV, cv);
         if (ch2) put(DISC, dv);
+        if (ch3) put(ADD, ad);
       } catch (err) {}
     }
     else if (d.indexOf('MHUB-CHECK:') === 0) { try { runCheck(JSON.parse(d.slice(11))); } catch (err) {} }
@@ -136,6 +140,7 @@ if (isHub || topMode) {
     GM_addValueChangeListener(LOG, function (n, o, v, remote) { if (remote) send(); });
     GM_addValueChangeListener(COV, function (n, o, v, remote) { if (remote) send(); });
     GM_addValueChangeListener(DISC, function (n, o, v, remote) { if (remote) send(); });
+    GM_addValueChangeListener(ADD, function (n, o, v, remote) { if (remote) send(); });
   }
   if (isHub) { post('MHUB-CORE:' + VERSION); send(); }
   else {
@@ -587,6 +592,99 @@ function discover() {
   if (discQ.length && !discBusy) runDisc();
 }
 
+/* ---------- Serienseite: Stand aus dem Hub, Weiterlesen, gelesene Kapitel markieren ---------- */
+var card = null, cardKey = '', libRaw = '', libList = [];
+function libEntry(key) {
+  var raw = GM_getValue(LIB, '[]');
+  if (raw !== libRaw) { libRaw = raw; try { libList = JSON.parse(raw) || []; } catch (e) { libList = []; } }
+  for (var i = 0; i < libList.length; i++) {
+    var e = libList[i];
+    if ((e.k || []).some(function (x) { return x === key || (Math.min(x.length, key.length) >= 6 && (x.indexOf(key) > -1 || key.indexOf(x) > -1)); })) return e;
+  }
+  return null;
+}
+// Stand aus dem Hub, ergänzt um das, was du auf diesem Gerät seitdem gelesen hast
+function seriesState(e, base) {
+  var st = { r: e.r || 0, c: e.c ? { n: e.c.n, pct: e.c.pct, url: '' } : null, u: e.u || '', n: e.n }, l = get(LOG);
+  Object.keys(l).filter(function (k) { return pathOf(k).toLowerCase().indexOf(base) > -1 && l[k].t > (e.at || 0); })
+    .sort(function (a, b) { return l[a].t - l[b].t; })
+    .forEach(function (k) {
+      var n = chOf(k); if (n == null) return;
+      if (l[k].pct >= 95) { if (n > st.r) st.r = n; if (st.c && st.c.n <= st.r) st.c = null; }
+      else if (n > st.r) st.c = { n: n, pct: l[k].pct, url: k };
+    });
+  if (st.c) st.n = st.c.n;
+  else if (st.n == null || st.n <= st.r) st.n = st.r + 1 <= (e.m || 0) ? Math.floor(st.r) + 1 : null;
+  return st;
+}
+// Kapitel-Links dieser Serie auf der Seite
+function chapLinks(base) {
+  var out = [];
+  document.querySelectorAll('a[href]').forEach(function (a) {
+    var u = absUrl(a.getAttribute('href')), n = chOf(u);
+    if (n != null && pathOf(u).toLowerCase().indexOf(base) > -1 && new URL(u).hostname === location.hostname) out.push({ a: a, n: n, u: u });
+  });
+  return out;
+}
+function cardBtn(label, fn, main) {
+  var b = document.createElement('div');
+  b.setAttribute('role', 'button'); b.textContent = label;
+  b.style.cssText = 'flex:none;padding:8px 12px;border-radius:999px;cursor:pointer;font-weight:700;white-space:nowrap;' + (main ? 'background:#913fe2;color:#fff' : 'background:#2a2639;color:#ece9f6');
+  b.addEventListener('click', function (ev) { ev.preventDefault(); ev.stopPropagation(); fn(); });
+  return b;
+}
+function seriesCard() {
+  if (isChapter() || !SERIES.test(path)) { if (card) { card.remove(); card = null; } return; }
+  var self = (location.origin + path).replace(/\/$/, ''), base = slugBase(self), key = base.replace(/[^a-z0-9]/g, '');
+  var e = libEntry(key), links = chapLinks(base), st = e ? seriesState(e, base) : null;
+  // Kapitelliste: gelesene abdunkeln, aktuelles gelb umranden
+  links.forEach(function (x) {
+    var mode = !st ? '' : (st.c && x.n === st.c.n ? 'c' : (x.n <= st.r ? 'r' : ''));
+    if (x.a.getAttribute('data-mhub') === mode) return;
+    x.a.setAttribute('data-mhub', mode);
+    x.a.style.opacity = mode === 'r' ? '0.45' : '';
+    // Umrandung aufs innere Element, wenn der Link selbst nur eine Textzeile ist
+    var box = (getComputedStyle(x.a).display === 'inline' && x.a.firstElementChild) || x.a;
+    box.style.outline = mode === 'c' ? '2px solid #ffc21a' : '';
+    box.style.outlineOffset = mode === 'c' ? '-2px' : '';
+  });
+  var adds = get(ADD), sig = JSON.stringify([self, st, !!adds[self], links.length]);
+  if (card && sig === cardKey) return;
+  cardKey = sig;
+  if (!card) {
+    card = document.createElement('div'); card.id = 'mhub-card';
+    card.style.cssText = 'position:fixed;left:8px;right:8px;margin-left:auto;bottom:calc(60px + env(safe-area-inset-bottom, 0px));z-index:2147483646;display:flex;align-items:center;gap:10px;' +
+      'background:#1f1c2c;color:#ece9f6;border:1px solid #913fe2;border-radius:14px;padding:8px 8px 8px 12px;box-shadow:0 4px 18px rgba(0,0,0,.55);font:500 13px/1.3 system-ui,sans-serif;max-width:460px';
+    (document.body || document.documentElement).appendChild(card);
+  }
+  card.innerHTML = '';
+  var info = document.createElement('div'); info.style.cssText = 'flex:1;min-width:0';
+  var l1 = document.createElement('div'), l2 = document.createElement('div');
+  l1.style.cssText = 'font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
+  l2.style.cssText = 'font-size:12px;color:#9893b0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
+  info.appendChild(l1); info.appendChild(l2); card.appendChild(info);
+  if (!e) {
+    l1.textContent = adds[self] ? '✓ Kommt in den Hub' : 'Nicht in deinem Hub';
+    l2.textContent = adds[self] ? 'als „Geplant“, sobald der Hub offen ist' : 'Als „Geplant“ merken?';
+    if (!adds[self]) card.appendChild(cardBtn('+ Zum Hub', function () {
+      var ad = get(ADD); ad[self] = { t: Date.now() }; put(ADD, ad);
+      var dv = get(DISC); if (dv[self]) { dv[self].ack = false; put(DISC, dv); }
+      else if (!discSeen[self]) { discSeen[self] = 1; discQ.unshift({ url: self, title: document.title, rating: null, ch: null, chUrl: null, imgSrc: '' }); if (!discBusy) runDisc(); }
+      cardKey = ''; seriesCard();
+    }, true));
+    return;
+  }
+  l1.textContent = st.c ? 'Kapitel ' + st.c.n + ' · ' + st.c.pct + ' %' : (st.r ? 'Gelesen bis Kapitel ' + st.r : 'Noch nicht angefangen');
+  var open = e.m ? Math.max(0, Math.floor(e.m) - Math.floor(st.r)) : 0;
+  l2.textContent = 'Im Hub' + (e.m ? ' · ' + (open ? open + ' offen' : 'alles gelesen') : '');
+  if (st.n == null) return;
+  // Bevorzugt auf dieser Seite weiterlesen, sonst der Link aus dem Hub
+  var here = links.filter(function (x) { return x.n === st.n; })[0], url = here ? here.u : (st.c && st.c.url) || e.u;
+  if (!url) return;
+  if (st.c && st.c.pct > 2 && st.c.pct < 95) url = url.replace(/#.*$/, '') + '#mhub-' + st.c.pct;
+  card.appendChild(cardBtn(st.c ? 'Weiterlesen' : (st.r ? 'Kapitel ' + st.n : 'Lesen'), function () { location.href = url; }, true));
+}
+
 function copyAll() {
   save(true);
   var t = token(true);
@@ -601,6 +699,7 @@ function route() {
   save(true);
   teardownReader();
   path = location.pathname; box = null; imgCount = -1;
+  if (card) { card.remove(); card = null; }
   if (CH.test(path.toLowerCase())) {
     var e = get(LOG)[location.origin + path], target = (e && e.pct) || 0;
     var anc = e && e.i != null ? { i: e.i, f: e.f, n: e.n } : null;
@@ -624,6 +723,7 @@ function route() {
     });
   } else {
     pill.style.display = 'none'; cleanBtn.style.display = 'none';
+    cardKey = ''; setTimeout(seriesCard, 800);
     clearTimeout(dockT); dock.style.opacity = '1'; dock.style.pointerEvents = 'auto';
     if (SERIES.test(path)) {
       setTimeout(function () { grabCover(false); }, 1500);
@@ -651,7 +751,7 @@ if (typeof GM_registerMenuCommand === 'function') {
   GM_registerMenuCommand('Stand kopieren', copyAll);
   GM_registerMenuCommand('Cover dieser Seite merken', function () { grabCover(true); });
 }
-setInterval(function () { route(); if (isChapter()) onScroll(); }, 1200);
+setInterval(function () { route(); if (isChapter()) onScroll(); else seriesCard(); }, 1200);
 route();
 if (!isChapter()) flash('📖 Manhwa Hub aktiv');
 
