@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.26.0
+// @version      3.26.1
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.26.0';
+var VERSION = '3.26.1';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -196,7 +196,7 @@ function cleanLabel() { cleanBtn.textContent = cleanOn() ? 'Original' : L('Nur B
 function fadeCover(on) {
   var f = document.getElementById('mhub-fade');
   if (on) {
-    if (!f) { f = document.createElement('div'); f.id = 'mhub-fade'; f.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:#0b0a10;z-index:2147483645;pointer-events:none;opacity:1;transition:opacity .2s'; (document.body || document.documentElement).appendChild(f); }
+    if (!f) { f = document.createElement('div'); f.id = 'mhub-fade'; f.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:#000;z-index:2147483645;pointer-events:none;opacity:1;transition:opacity .2s'; (document.body || document.documentElement).appendChild(f); }
     f.style.opacity = '1'; clearTimeout(fadeCover.t); fadeCover.t = setTimeout(function () { fadeCover(false); }, 2500); return;
   }
   clearTimeout(fadeCover.t);
@@ -328,12 +328,12 @@ function buildReader() {
   // Bilder ohne normale Adresse (z. B. auf Canvas gezeichnet): Lesemodus hier nicht möglich
   if (addReaderImgs(srcImgs) < 3) { reader = null; return 'skip'; }
   readerStyle = document.createElement('style');
-  readerStyle.textContent = 'html,body{background:#0b0a10!important;overflow-x:hidden!important;overflow-y:auto!important;margin:0!important}' +
+  readerStyle.textContent = 'html,body{background:#000!important;overflow-x:hidden!important;overflow-y:auto!important;margin:0!important}' +
     'body>*:not(#mhub-reader):not(#mhub-dock):not(#mhub-nav):not(#mhub-peek):not(#mhub-fade){display:none!important}' +
-    '#mhub-nav{display:flex!important;gap:8px;max-width:820px;margin:0 auto;padding:18px 12px 120px;background:#0b0a10;font:700 15px system-ui,sans-serif}' +
+    '#mhub-nav{display:flex!important;gap:8px;max-width:820px;margin:0 auto;padding:18px 12px 120px;background:#000;font:700 15px system-ui,sans-serif}' +
     '#mhub-nav a{flex:1;display:flex;align-items:center;justify-content:center;min-height:52px;border-radius:12px;background:#2a2639;color:#ece9f6;text-decoration:none;text-align:center;padding:0 10px}' +
     '#mhub-nav a.nx{background:#913fe2;color:#fff;flex:1.4}#mhub-nav span{flex:1.4;display:flex;align-items:center;justify-content:center;color:#9893b0}' +
-    '#mhub-reader{display:block!important;background:#0b0a10;padding:0;margin:0;touch-action:manipulation}' +
+    '#mhub-reader{display:block!important;background:#000;padding:0;margin:0;touch-action:manipulation}' +
     '#mhub-reader img{display:block;width:100%;max-width:820px;height:auto;margin:0 auto;border:0}';
   (document.head || document.documentElement).appendChild(readerStyle);
   document.body.appendChild(reader);
@@ -581,7 +581,7 @@ function moveReader(x, ms) {
 function makePeek(p, dir) {
   dropPeek();
   var d = document.createElement('div'); d.id = 'mhub-peek'; d._dir = dir;
-  d.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100vh;overflow:hidden;z-index:2147483640;background:#0b0a10;pointer-events:none;will-change:transform;transform:translateX(' + (dir * viewW()) + 'px)';
+  d.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100vh;overflow:hidden;z-index:2147483640;background:#000;pointer-events:none;will-change:transform;transform:translateX(' + (dir * viewW()) + 'px)';
   var a = ancFor(p.url, p.imgs), from = a ? Math.max(0, a.i - 1) : 0, inner = document.createElement('div'), els = [];
   inner.style.cssText = 'position:absolute;left:0;right:0;top:0';
   // Synchron zeichnen: sonst lässt der Browser die Bilder beim Springen der Seite darunter ein Bild lang weg (schwarz)
