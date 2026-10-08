@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.31.0
+// @version      3.32.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.31.0';
+var VERSION = '3.32.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -51,7 +51,7 @@ function token(forClipboard) {
   var c = Object.keys(cv).filter(function (k) { return !cv[k].ack && (!forClipboard || (cv[k].sent || 0) < 2); })
     .map(function (k) { return { url: k, img: cv[k].img, title: cv[k].title, q: cv[k].q || 0 }; });
   var dd = get(DISC), d = Object.keys(dd).filter(function (k) { return !dd[k].ack; }).slice(0, forClipboard ? 30 : 150)
-    .map(function (k) { var e = dd[k]; return { url: k, title: e.title, rating: e.rating, ch: e.ch, chUrl: e.chUrl, img: e.img, site: e.site, g: e.g, desc: e.desc, type: e.type, rel: e.rel, ss: e.ss || '', q: e.q || 0 }; });
+    .map(function (k) { var e = dd[k]; return { url: k, title: e.title, rating: e.rating, ch: e.ch, chUrl: e.chUrl, img: e.img, site: e.site, g: e.g, desc: e.desc, type: e.type, rel: e.rel, ss: e.ss || '', q: e.q || 0, feat: e.feat || 0 }; });
   var a = forClipboard ? [] : Object.keys(get(ADD));
   var rr = get('mhub_rate'), r = Object.keys(rr).map(function (k) { return { k: k, r: rr[k].r, t: rr[k].t }; });
   if (!p.length && !c.length && !d.length && !a.length && !r.length) return '';
@@ -1231,6 +1231,7 @@ function onlySeries(el, key, base) {
   }
   return true;
 }
+var FEAT_SEL = '[class*="swiper"],[class*="slider"],[class*="carousel"],[class*="featured"],[class*="splide"],[class*="slick"],[class*="embla"],[class*="hero"],[class*="spotlight"]';
 function scrapeCards() {
   var map = {}, out = [];
   document.querySelectorAll('a[href]').forEach(function (a) {
@@ -1265,7 +1266,9 @@ function scrapeCards() {
       var u = absUrl(a.getAttribute('href')), n = chOf(u);
       if (n != null && (chN == null || n > chN)) { chN = n; chU = u; }
     });
-    out.push({ url: k, title: title.slice(0, 120), rating: rating, ch: chN, chUrl: chU, type: type,
+    // Steht die Karte in einem Slider/Karussell (oben auf der Startseite der Scan-Seite), ist sie gerade hervorgehoben
+    var feat = !!(card.closest && card.closest(FEAT_SEL));
+    out.push({ url: k, title: title.slice(0, 120), rating: rating, ch: chN, chUrl: chU, type: type, feat: feat,
       imgSrc: img ? (img.currentSrc || img.src || img.getAttribute('data-src') || '') : '' });
   });
   return out;
@@ -1277,7 +1280,7 @@ function enrich(c, cb) {
       var doc = null;
       try { if (r.status === 200) doc = new DOMParser().parseFromString(r.responseText, 'text/html'); } catch (e) {}
       var og = doc && doc.querySelector('meta[property="og:image"]'), ot = doc && doc.querySelector('meta[property="og:title"]');
-      var e = { title: (ot && ot.content) || c.title, rating: c.rating, ch: c.ch, chUrl: c.chUrl, img: '', site: location.hostname, t: Date.now(),
+      var e = { title: (ot && ot.content) || c.title, rating: c.rating, ch: c.ch, chUrl: c.chUrl, img: '', site: location.hostname, t: Date.now(), feat: c.feat ? Date.now() : 0,
         g: [], desc: '', type: c.type || '', rel: [] };
       if (doc) {
         var seen = {}, rel = {};
@@ -1425,7 +1428,10 @@ function discover() {
       var nr = c.rating && c.rating !== e.rating, nc = c.ch != null && c.ch > (e.ch || 0);
       if (nr) e.rating = c.rating;
       if (nc) { e.ch = c.ch; e.chUrl = c.chUrl; }
-      if (nr || nc) { e.ack = false; changed = true; }
+      // Hervorgehoben: höchstens alle 12 Stunden neu melden
+      var nf = c.feat && Date.now() - (e.feat || 0) > 12 * 3600e3;
+      if (nf) e.feat = Date.now();
+      if (nr || nc || nf) { e.ack = false; changed = true; }
       return;
     }
     if (discSeen[c.url]) return;
