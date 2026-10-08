@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.34.0
+// @version      3.35.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.34.0';
+var VERSION = '3.35.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -176,22 +176,8 @@ if (isHub || topMode) {
       });
     })();
   };
-  // Ältere, kleine Cover neu holen (MHUB-COVERS: [{id, page}]): og:image der Serienseite, größte srcset-Variante dazu
-  var absFull = function (h, base) { try { return new URL(h, base).href; } catch (e) { return ''; } };
-  var coverOfPage = function (doc, page) {
-    var og = doc.querySelector('meta[property="og:image"],meta[name="twitter:image"]');
-    var ogU = og && og.content ? absFull(og.content, page) : ''; if (!ogU) return '';
-    var fileOf = function (u) { return u.split(/[?#]/)[0].split('/').pop(); }, base = fileOf(ogU), best = ogU, bw = 0;
-    [].forEach.call(doc.querySelectorAll('img[srcset],source[srcset]'), function (im) {
-      String(im.getAttribute('srcset')).split(',').forEach(function (part) {
-        var m = part.trim().match(/^(\S+)\s+(\d+)w$/); if (!m) return;
-        var u = absFull(m[1], page), q = ''; try { q = new URL(m[1], page).searchParams.get('url') || ''; } catch (e) {}
-        if (q) u = absFull(q, page);
-        if (fileOf(u) === base && +m[2] > bw) { bw = +m[2]; best = u; }
-      });
-    });
-    return best;
-  };
+  // Cover neu holen (MHUB-COVERS: [{id, page, w}]): Bild der Serienseite in passender Größe (docCoverUrl).
+  // Funde (w gesetzt): dq = Stufe im Hub, 3 = beste Quelle, 4 = groß (600 px, fürs Karussell)
   var runCovers = function (jobs) {
     if (!Array.isArray(jobs)) return;
     var i = 0;
@@ -200,8 +186,9 @@ if (isHub || topMode) {
       var j = jobs[i++];
       fetchText(j.page, function (html) {
         var doc = null; try { doc = html ? new DOMParser().parseFromString(html, 'text/html') : null; } catch (e) {}
-        var u = doc ? coverOfPage(doc, j.page) : '', desc = doc ? fullDesc(doc) : '';
-        var done = function (img) { post('MHUB-COVEROK:' + JSON.stringify({ id: j.id, img: img || '', q: COVER_Q, desc: desc })); setTimeout(next, 1200); };
+        var ot = doc && doc.querySelector('meta[property="og:title"]');
+        var u = doc ? docCoverUrl(doc, j.page, Math.round((j.w || COVER_W) * 1.5), ot && ot.content) : '', desc = doc ? fullDesc(doc) : '';
+        var done = function (img, w) { post('MHUB-COVEROK:' + JSON.stringify({ id: j.id, img: img || '', q: COVER_Q, dq: j.w >= 600 && w >= 570 ? 4 : 3, desc: desc })); setTimeout(next, 1200); };
         if (!u) return done('');
         shrink(u, done, j.w);
       });
@@ -1175,7 +1162,8 @@ pill.addEventListener('click', function () {
    Stark verkleinert wird in Halbschritten, sonst wirkt das Bild krisselig. Das Ergebnis bleibt unter 170 000
    Zeichen, damit es in ein Cloud-Dokument passt. COVER_Q: Qualitätsstufe; ältere Cover werden einmal neu geholt. */
 function coverData(bmp, maxW) {
-  var W = Math.min(maxW || COVER_W, Math.max(Math.min(360, maxW || 360), Math.round(bmp.width))), H = Math.round(W * COVER_H / COVER_W);
+  // Nie hochrechnen: ein kleines Original bleibt klein (vergrößern macht es nur unschärfer und größer)
+  var W = Math.max(1, Math.min(maxW || COVER_W, Math.round(bmp.width))), H = Math.round(W * COVER_H / COVER_W);
   var k = Math.max(W / bmp.width, H / bmp.height), w = bmp.width * k, h = bmp.height * k;
   var src = bmp, sw = bmp.width, sh = bmp.height;
   while (sw / 2 >= w) {
@@ -1194,14 +1182,60 @@ function coverData(bmp, maxW) {
   }
   return d;
 }
-// maxW: kleinere Vorschau (Entdecken)
+// maxW: kleinere Vorschau (Entdecken). cb(Bild, Breite des Ergebnisses)
 function shrink(src, cb, maxW) {
   GM_xmlhttpRequest({ method: 'GET', url: src, responseType: 'blob', timeout: 15000,
     onload: function (res) {
-      if (res.status !== 200 || !res.response) return cb('');
-      createImageBitmap(res.response).then(function (bmp) { cb(coverData(bmp, maxW)); }).catch(function () { cb(''); });
+      if (res.status !== 200 || !res.response) return cb('', 0);
+      createImageBitmap(res.response).then(function (bmp) { cb(coverData(bmp, maxW), Math.min(maxW || COVER_W, bmp.width)); }).catch(function () { cb('', 0); });
     },
-    onerror: function () { cb(''); }, ontimeout: function () { cb(''); } });
+    onerror: function () { cb('', 0); }, ontimeout: function () { cb('', 0); } });
+}
+/* Passende Bildgröße wählen: aus srcset die kleinste Variante, die mindestens need Pixel breit ist (scharf nach dem
+   Verkleinern, ohne riesige Originale zu laden), sonst die größte. Varianten: [{u, w}] */
+function srcsetList(set, base) {
+  var out = [];
+  String(set || '').split(',').forEach(function (part) {
+    var m = part.trim().match(/^(\S+)\s+(\d+)w$/); if (!m) return;
+    try { out.push({ u: new URL(m[1], base).href, w: +m[2] }); } catch (e) {}
+  });
+  return out;
+}
+function fitVariant(vars, need) {
+  if (!vars.length) return null;
+  vars.sort(function (a, b) { return a.w - b.w; });
+  for (var i = 0; i < vars.length; i++) if (vars[i].w >= need) return vars[i];
+  return vars[vars.length - 1];
+}
+// Bild einer Karte (Entdecken): passende Variante aus srcset/picture, sonst das Original hinter einem Bild-Proxy
+function fitSrc(im, need) {
+  var set = im.getAttribute('srcset') || im.getAttribute('data-srcset') || '';
+  var pic = im.parentElement && im.parentElement.tagName === 'PICTURE' ? im.parentElement : null;
+  if (pic) [].forEach.call(pic.querySelectorAll('source'), function (s) { set += ',' + (s.getAttribute('srcset') || s.getAttribute('data-srcset') || ''); });
+  var v = fitVariant(srcsetList(set, location.href), need);
+  return v ? v.u : bestSrc(im);
+}
+// Cover einer abgerufenen Serienseite: og:image, oder eine Variante desselben Bildes (gleicher Dateiname, auch hinter
+// /_next/image?url=…) bzw. ein Bild, dessen Alt-Text der Titel ist, in passender Größe
+function docCoverUrl(doc, base, need, title) {
+  var abs = function (h) { try { return new URL(h, base).href; } catch (e) { return ''; } };
+  var fileOf = function (u) {
+    var x = u; try { var q = new URL(u).searchParams.get('url'); if (q) x = abs(q); } catch (e) {}
+    return x.split(/[?#]/)[0].split('/').pop().toLowerCase();
+  };
+  var og = doc.querySelector('meta[property="og:image"],meta[name="twitter:image"]'), ogU = og && og.content ? abs(og.content) : '';
+  var ogF = ogU ? fileOf(ogU) : '', tt = normT(title || ''), vars = [];
+  [].forEach.call(doc.querySelectorAll('img[srcset],img[data-srcset],source[srcset]'), function (im) {
+    var img = im.tagName === 'IMG' ? im : im.parentElement && im.parentElement.querySelector('img');
+    var alt = normT(img ? img.getAttribute('alt') || '' : '');
+    srcsetList(im.getAttribute('srcset') || im.getAttribute('data-srcset'), base).forEach(function (v) {
+      if ((ogF && fileOf(v.u) === ogF) || (tt && alt === tt)) vars.push(v);
+    });
+  });
+  var v = fitVariant(vars, need);
+  // Reicht keine Variante, ist og:image meist das Original
+  if (!v || (v.w < need && ogU)) return ogU || (v ? v.u : '');
+  return v.u;
 }
 // Bestes Cover der Seite: das Bild zum og:image (mit größter Variante aus srcset), sonst das größte Hochformat-Bild
 // oben auf der Seite, dessen Alt-Text zum Titel passt, sonst og:image
@@ -1286,7 +1320,7 @@ function scrapeCards() {
     // Steht die Karte in einem Slider/Karussell (oben auf der Startseite der Scan-Seite), ist sie gerade hervorgehoben
     var feat = !!(card.closest && card.closest(FEAT_SEL));
     out.push({ url: k, title: title.slice(0, 120), rating: rating, ch: chN, chUrl: chU, type: type, feat: feat,
-      imgSrc: img ? (img.currentSrc || img.src || img.getAttribute('data-src') || '') : '' });
+      imgSrc: img ? fitSrc(img, feat ? 900 : 600) : '' });
   });
   return out;
 }
@@ -1332,10 +1366,11 @@ function fromDoc(c, doc, cb) {
     if (!e.type && /\/novels?\//i.test(c.url)) e.type = 'Novel';
     e.ss = siteStatus(doc);
   }
-  var src = (og && og.content) || c.imgSrc;
+  // 400 px breit: scharf in der Entdecken-Liste auch bei hoher Pixeldichte; hervorgehobene (fürs Karussell) 600 px.
+  // Quelle in passender Größe (docCoverUrl), sonst das Bild der Karte
+  var big = !!c.feat, src = (doc && docCoverUrl(doc, c.url, big ? 900 : 600, e.title)) || (og && og.content) || c.imgSrc;
   if (!src || /^data:/.test(src)) return cb(e);
-  // 400 px breit: scharf in der Entdecken-Leiste auch bei hoher Pixeldichte
-  shrink(src, function (d) { e.img = d; e.q = d ? 2 : 0; cb(e); }, 400);
+  shrink(src, function (d, w) { e.img = d; e.q = d ? (big && w >= 570 ? 4 : 3) : 0; cb(e); }, big ? 600 : 400);
 }
 // Art (Manhwa, Novel …) aus einem Abzeichen lesen: ein Element, dessen Text genau so heißt
 function badgeType(root) {
