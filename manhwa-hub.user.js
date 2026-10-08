@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.39.0
+// @version      3.40.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.39.0';
+var VERSION = '3.40.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -1350,6 +1350,21 @@ function onlySeries(el, key, base) {
   return true;
 }
 var FEAT_SEL = '[class*="swiper"],[class*="slider"],[class*="carousel"],[class*="featured"],[class*="splide"],[class*="slick"],[class*="embla"],[class*="hero"],[class*="spotlight"]';
+// Titel aus einer Karte säubern: Art-Abzeichen vorne („manhwa …“), „Chapter 143 …“ hinten (auch angeklebt wie
+// „BraveChapter 12“) und eine Wertung am Ende („… 9.5“) gehören nicht zum Namen
+function cleanCardTitle(t) {
+  t = String(t || '').replace(/\s+/g, ' ').trim();
+  t = t.replace(/^(?:manhwa|manga|manhua|novel|webtoon|comic)\s+(?=\S)/i, '');
+  t = t.replace(/\s*(?:chapter|chap|kapitel|episode|ch\.|ep\.)\s*\d[\d.,]*.*$/i, '');
+  t = t.replace(/\s+\d{1,2}[.,]\d{1,2}$/, '');
+  return t.trim();
+}
+// Text mit Leerzeichen zwischen den Teilen (textContent klebt „Brave“ und „Chapter“ zusammen)
+function spacedText(el) {
+  var w = el.ownerDocument.createTreeWalker(el, 4), out = [], n;
+  while ((n = w.nextNode())) out.push(n.nodeValue);
+  return out.join(' ').replace(/\s+/g, ' ').trim();
+}
 function scrapeCards() {
   var map = {}, out = [];
   document.querySelectorAll('a[href]').forEach(function (a) {
@@ -1368,13 +1383,15 @@ function scrapeCards() {
       }
     }
     card = card || as[0];
-    var title = '';
-    as.forEach(function (a) {
-      var t = (a.getAttribute('title') || a.textContent || '').replace(/\s+/g, ' ').trim();
-      if (t.length > title.length && t.length < 120 && !/^(chapter|kapitel|ch\.?)\s*\d/i.test(t)) title = t;
-    });
-    var img = card.tagName === 'IMG' ? card : card.querySelector('img');
-    if (!title && img) title = img.alt || '';
+    // Titel: Überschrift der Karte, sonst title-Attribut, Alt-Text des Bildes, sonst der längste Linktext (gesäubert)
+    var img = card.tagName === 'IMG' ? card : card.querySelector('img'), title = '';
+    var head = card.querySelector && card.querySelector('h1,h2,h3,h4,h5,[class*="title"],[class*="name"]');
+    var cands = [head ? spacedText(head) : ''];
+    as.forEach(function (a) { cands.push(a.getAttribute('title') || ''); });
+    cands.push(img ? img.alt || '' : '');
+    var lt = ''; as.forEach(function (a) { var t = spacedText(a); if (t.length > lt.length && t.length < 160 && !/^(chapter|kapitel|ch\.?)\s*\d/i.test(t)) lt = t; });
+    cands.push(lt);
+    for (var ci = 0; ci < cands.length && !title; ci++) { var ct = cleanCardTitle(cands[ci]); if (ct.length >= 2 && ct.length < 120) title = ct; }
     if (!title) return;
     var text = card.innerText || card.textContent || '', rating = null, re = /(\d{1,2}[.,]\d{1,2})/g, m;
     while ((m = re.exec(text))) { var v = parseFloat(m[1].replace(',', '.')); if (v > 0 && v <= 10) { rating = v; break; } }
