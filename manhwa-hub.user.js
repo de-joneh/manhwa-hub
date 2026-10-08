@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.40.0
+// @version      3.41.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.40.0';
+var VERSION = '3.41.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -1573,9 +1573,14 @@ function runDisc() {
   (function next() {
     var q = dqGet();
     if (!q.length || document.hidden) { dqBusy = false; if (done) discNote('✓ ' + done + L(' Manhwas für den Hub gemerkt', ' manhwas saved for the hub')); return; }
-    var c = q.shift(); dqPut(q);
-    if (q.length % 5 === 0) discNote(L('🔎 Entdecke … noch ', '🔎 Discovering … ') + (q.length + 1) + L('', ' left'));
-    enrich(c, function (e) { if (e) { discStore(c.url, e); done++; } setTimeout(next, 600); });
+    // Erst nach dem Abruf aus der Warteschlange nehmen: wird die Seite mittendrin geschlossen, geht nichts verloren
+    var c = q[0];
+    if (q.length % 5 === 1) discNote(L('🔎 Entdecke … noch ', '🔎 Discovering … ') + q.length + L('', ' left'));
+    enrich(c, function (e) {
+      if (e) { discStore(c.url, e); done++; }
+      dqPut(dqGet().filter(function (x) { return x.url !== c.url; }));
+      setTimeout(next, 600);
+    });
   })();
 }
 // In die Warteschlange (vorne: die gerade offene Serienseite), ohne doppelte
