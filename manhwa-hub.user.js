@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.42.0
+// @version      3.43.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.42.0';
+var VERSION = '3.43.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -567,7 +567,8 @@ function chapterTargets(root, pth) {
   var make = function (k) { return location.origin + pth.replace(CHPART, function (all, a) { return a + k; }); };
   var prevN = Math.ceil(n) - 1, nextN = Math.floor(n) + 1;
   var prev = found[prevN] || (prevN >= 1 ? make(prevN) : '');
-  var next = found[nextN] || (e && e.m >= nextN ? make(nextN) : '');
+  // Nicht auf dieser Seite verlinkt: Adresse aus dem Hub (kann eine andere Seite sein, die das Kapitel schon hat)
+  var next = found[nextN] || (e && e.x && e.x[String(nextN)]) || (e && e.m >= nextN ? make(nextN) : '');
   var home = head.replace(/[-_\/]+$/, ''), homeUrl = isSeriesUrl(location.origin + home) ? location.origin + home : '';
   return { prev: prev, prevN: prevN, next: next, nextN: nextN, homeUrl: homeUrl, n: n, key: key, lib: e };
 }
@@ -594,7 +595,8 @@ function chapterNav() {
   var card = endCard(t); if (card) nav.appendChild(card);
   if (prev) link(prev, '‹ ' + prevN);
   if (homeUrl) link(homeUrl, L('Serie', 'Series'));
-  if (next) link(next, L('Kapitel ', 'Chapter ') + nextN + ' ›', 'nx');
+  var other = next && hostOf(next) !== location.hostname ? hostOf(next).replace(/^www\./, '').split('.')[0] : '';
+  if (next) link(next, L('Kapitel ', 'Chapter ') + nextN + (other ? L(' auf ', ' on ') + other.charAt(0).toUpperCase() + other.slice(1) : '') + ' ›', 'nx');
   else { var sp = document.createElement('span'); sp.textContent = L('Neuestes Kapitel ✓', 'Latest chapter ✓'); nav.appendChild(sp); }
   // Klicks nicht an die Seite weitergeben (Werbe-Fenster)
   nav.addEventListener('click', function (ev) { ev.stopPropagation(); });
@@ -784,6 +786,8 @@ function ancFor(u, imgs) {
 // Kapitel holen (einmal), Ergebnis im Speicher pre[url] = {state: loading|ok|none, imgs, doc}; Wartende werden benachrichtigt
 function fetchChapter(u) {
   if (pre[u] && pre[u].state !== 'none') return pre[u];
+  // Kapitel auf einer anderen Seite: kann hier nicht vorgeladen werden, Wischen/Weiter laden es dann normal
+  if (hostOf(u) && hostOf(u) !== location.hostname) return (pre[u] = { state: 'none', url: u, w: [], t: Date.now() });
   var e = pre[u] = { state: 'loading', url: u, w: [], t: Date.now() };
   var fin = function () { var w = e.w; e.w = []; w.forEach(function (f) { try { f(); } catch (er) {} }); };
   fetch(u, { credentials: 'include' }).then(function (r) { return r.ok ? r.text() : ''; }).then(function (html) {
