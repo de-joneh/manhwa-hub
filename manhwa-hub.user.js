@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.30.0
+// @version      3.31.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.30.0';
+var VERSION = '3.31.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -51,7 +51,7 @@ function token(forClipboard) {
   var c = Object.keys(cv).filter(function (k) { return !cv[k].ack && (!forClipboard || (cv[k].sent || 0) < 2); })
     .map(function (k) { return { url: k, img: cv[k].img, title: cv[k].title, q: cv[k].q || 0 }; });
   var dd = get(DISC), d = Object.keys(dd).filter(function (k) { return !dd[k].ack; }).slice(0, forClipboard ? 30 : 150)
-    .map(function (k) { var e = dd[k]; return { url: k, title: e.title, rating: e.rating, ch: e.ch, chUrl: e.chUrl, img: e.img, site: e.site, g: e.g, desc: e.desc, type: e.type, rel: e.rel, ss: e.ss || '' }; });
+    .map(function (k) { var e = dd[k]; return { url: k, title: e.title, rating: e.rating, ch: e.ch, chUrl: e.chUrl, img: e.img, site: e.site, g: e.g, desc: e.desc, type: e.type, rel: e.rel, ss: e.ss || '', q: e.q || 0 }; });
   var a = forClipboard ? [] : Object.keys(get(ADD));
   var rr = get('mhub_rate'), r = Object.keys(rr).map(function (k) { return { k: k, r: rr[k].r, t: rr[k].t }; });
   if (!p.length && !c.length && !d.length && !a.length && !r.length) return '';
@@ -202,7 +202,7 @@ if (isHub || topMode) {
         var u = html ? coverOfPage(html, j.page) : '';
         var done = function (img) { post('MHUB-COVEROK:' + JSON.stringify({ id: j.id, img: img || '', q: COVER_Q })); setTimeout(next, 1200); };
         if (!u) return done('');
-        shrink(u, done);
+        shrink(u, done, j.w);
       });
     })();
   };
@@ -237,7 +237,8 @@ if (isHub || topMode) {
         var urls = JSON.parse(d.slice(9)), cv = get(COV), dv = get(DISC), ad = get(ADD), ch = false, ch2 = false, ch3 = false;
         urls.forEach(function (u) {
           if (cv[u] && !cv[u].ack) { cv[u].ack = true; ch = true; }
-          if (dv[u] && !dv[u].ack) { dv[u].ack = true; ch2 = true; }
+          // Der Hub hat das Bild: hier nicht weiter aufheben, sonst wird der Speicher groß und langsam
+          if (dv[u] && (!dv[u].ack || dv[u].img)) { dv[u].ack = true; delete dv[u].img; ch2 = true; }
           if (ad[u]) { delete ad[u]; ch3 = true; }
         });
         if (ch) put(COV, cv);
@@ -1306,7 +1307,8 @@ function enrich(c, cb) {
       }
       var src = (og && og.content) || c.imgSrc;
       if (!src || /^data:/.test(src)) return cb(e);
-      shrink(src, function (d) { e.img = d; cb(e); }, 300);
+      // 400 px breit: scharf in der Entdecken-Leiste auch bei hoher Pixeldichte
+      shrink(src, function (d) { e.img = d; e.q = d ? 2 : 0; cb(e); }, 400);
     },
     onerror: function () { cb(null); }, ontimeout: function () { cb(null); } });
 }
