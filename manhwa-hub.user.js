@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.38.0
+// @version      3.39.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.38.0';
+var VERSION = '3.39.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -51,6 +51,24 @@ var DQ = 'mhub_discq', dqBusy = false, dqSendT = 0, DISC_KEEP = 300;
 function dqGet() { try { var a = JSON.parse(GM_getValue(DQ, '[]')); return Array.isArray(a) ? a : []; } catch (e) { return []; } }
 function dqPut(a) { GM_setValue(DQ, JSON.stringify(a.slice(0, 400))); }
 
+/* Serien-Schlüssel wie im Hub (slugOf + keyOf): Name aus der Adresse, ohne Kapitel und ohne wechselnde Kennung */
+var SERIES_SEG = ['series', 'manga', 'manhwa', 'manhua', 'comic', 'comics', 'title', 'webtoon', 'novel', 'novels'];
+function slugOfPath(p) {
+  var seg = p.split('/').filter(Boolean), i = -1;
+  for (var j = 0; j < seg.length; j++) if (SERIES_SEG.indexOf(seg[j]) > -1) { i = j; break; }
+  var s = (i > -1 && seg[i + 1]) ? seg[i + 1] : (seg.filter(function (x) { return /(?:^|-)(?:chapter|chap|ch|episode|ep)-?\d/.test(x); })[0] || seg[0] || '');
+  s = s.replace(/[-_]?(?:chapter|chap|ch|episode|ep)[-_]?\d+(?:[-_.]\d+)?.*$/, '');
+  s = s.replace(/-[a-z0-9]{8}$/, function (m) { return /\d/.test(m) ? '' : m; });
+  return s || seg[0] || '';
+}
+function seriesKeyOf(u) {
+  var p = ''; try { p = new URL(u).pathname; try { p = decodeURIComponent(p); } catch (e) {} } catch (e) { return ''; }
+  return slugOfPath(p.toLowerCase()).replace(/[^a-z0-9]/g, '');
+}
+// Neue Serien (noch nicht im Hub): erst nach deinem OK in den Hub, mit „gelesen bis“. {schlüssel: {ok, r, t}}
+var NEWQ = 'mhub_newq';
+function newDecision(k) { return get(NEWQ)[k] || null; }
+
 function get(k) { try { return JSON.parse(GM_getValue(k, '{}')) || {}; } catch (e) { return {}; } }
 // Sprache kommt vom Hub (MHUB-LANG)
 function L(de, en) { return GM_getValue('mhub_lang', 'de') === 'en' ? en : de; }
@@ -66,7 +84,14 @@ var hubWin = isHub ? window : null;
 function post(m) { if (hubWin) { try { hubWin.postMessage(m, '*'); } catch (e) {} } }
 function token(forClipboard) {
   var l = get(LOG), cv = get(COV);
-  var p = Object.keys(l).map(function (k) { return { url: k, pct: l[k].pct, t: l[k].t, site: l[k].site || 0, d: l[k].d || 0 }; });
+  // Stand von Serien, die noch nicht im Hub sind, erst nach deinem OK (Abfrage beim Lesen, askNew)
+  var nq = get(NEWQ), lib = GM_getValue(LIB, '');
+  var p = Object.keys(l).filter(function (k) {
+    if (!lib || forClipboard) return true;
+    var key = seriesKeyOf(k); if (!key || libEntry(key)) return true;
+    return !!(nq[key] && nq[key].ok);
+  }).map(function (k) { return { url: k, pct: l[k].pct, t: l[k].t, site: l[k].site || 0, d: l[k].d || 0 }; });
+  var n = Object.keys(nq).filter(function (k) { return nq[k].ok; }).map(function (k) { return { k: k, r: nq[k].r || 0 }; });
   var c = Object.keys(cv).filter(function (k) { return !cv[k].ack && (!forClipboard || (cv[k].sent || 0) < 2); })
     .map(function (k) { return { url: k, img: cv[k].img, title: cv[k].title, q: cv[k].q || 0 }; });
   var dd = get(DISC), d = Object.keys(dd).filter(function (k) { return !dd[k].ack; }).slice(0, forClipboard ? 30 : 150)
@@ -74,7 +99,7 @@ function token(forClipboard) {
   var a = forClipboard ? [] : Object.keys(get(ADD));
   var rr = get('mhub_rate'), r = Object.keys(rr).map(function (k) { return { k: k, r: rr[k].r, t: rr[k].t }; });
   if (!p.length && !c.length && !d.length && !a.length && !r.length) return '';
-  return 'MHUB2:' + btoa(unescape(encodeURIComponent(JSON.stringify({ p: p, c: c, d: d, a: a, r: r }))));
+  return 'MHUB2:' + btoa(unescape(encodeURIComponent(JSON.stringify({ p: p, c: c, d: d, a: a, r: r, n: n }))));
 }
 
 /* ---------- Im Hub ---------- */
@@ -253,7 +278,10 @@ if (isHub || topMode) {
       try { var list = JSON.parse(d.slice(11)); if (Array.isArray(list)) GM_setValue('mhub_sites', JSON.stringify(list)); } catch (err) {}
       post('MHUB-SITES-OK');
     }
-    else if (d.indexOf('MHUB-LIB:') === 0) { GM_setValue(LIB, d.slice(9)); }
+    else if (d.indexOf('MHUB-LIB:') === 0) {
+      // Erst mit der Bibliothek weiß das Skript, welche Serien neu sind (zurückgehaltener Stand geht dann raus)
+      var first = !GM_getValue(LIB, ''); GM_setValue(LIB, d.slice(9)); if (first) send();
+    }
     else if (d.indexOf('MHUB-KNOWN:') === 0) GM_setValue('mhub_known', d.slice(11));
     else if (d.indexOf('MHUB-ACK:') === 0) {
       try {
@@ -482,7 +510,7 @@ function buildReader() {
   if (addReaderImgs(srcImgs) < 3) { reader = null; return 'skip'; }
   readerStyle = document.createElement('style');
   readerStyle.textContent = 'html,body{background:#000!important;overflow-x:hidden!important;overflow-y:auto!important;margin:0!important}' +
-    'body>*:not(#mhub-reader):not(#mhub-dock):not(#mhub-nav):not(#mhub-peek):not(#mhub-fade):not(#mhub-next){display:none!important}' +
+    'body>*:not(#mhub-reader):not(#mhub-dock):not(#mhub-nav):not(#mhub-peek):not(#mhub-fade):not(#mhub-next):not(#mhub-ask){display:none!important}' +
     '#mhub-nav{display:flex!important;flex-wrap:wrap;gap:8px;max-width:var(--mhub-w,820px);margin:0 auto;padding:18px 12px 120px;background:#000;font:700 15px system-ui,sans-serif}' +
     '#mhub-nav a{flex:1;display:flex;align-items:center;justify-content:center;min-height:52px;border-radius:12px;background:#2a2639;color:#ece9f6;text-decoration:none;text-align:center;padding:0 10px}' +
     '#mhub-nav a.nx{background:#913fe2;color:#fff;flex:1.4}#mhub-nav span{flex:1.4;display:flex;align-items:center;justify-content:center;color:#9893b0}' +
@@ -676,7 +704,7 @@ function autoStartWhenReady(myPath) {
   setTimeout(function () { if (path === myPath) asStart(); }, 800);
 }
 var typing = function (e) { var t = e.target; return t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)); };
-var ours = function (el) { return el && el.closest && el.closest('#mhub-dock,#mhub-nav,#mhub-card,a,button,input,textarea,select,label'); };
+var ours = function (el) { return el && el.closest && el.closest('#mhub-dock,#mhub-nav,#mhub-card,#mhub-ask,a,button,input,textarea,select,label'); };
 if (DESK) {
   // Mausrad: während Auto-Scroll regelt es das Tempo, sonst scrollt es auf Wunsch weiter als normal
   window.addEventListener('wheel', function (e) {
@@ -930,6 +958,7 @@ function hint(dx, tg) {
 window.addEventListener('touchstart', function (e) {
   sw0 = null;
   if (!reader || !isChapter() || e.touches.length !== 1 || !prefs().swipe || preparing) return;
+  if (e.target && e.target.closest && e.target.closest('#mhub-ask')) return;
   var t = e.touches[0]; sw0 = { x: t.clientX, y: t.clientY, dx: 0, h: null };
 }, { passive: true, capture: true });
 window.addEventListener('touchmove', function (e) {
@@ -1829,6 +1858,43 @@ function seriesCard() {
   card.appendChild(cardBtn(st.c ? L('Weiterlesen', 'Continue') : (st.r ? L('Kapitel ', 'Chapter ') + st.n : L('Lesen', 'Read')), function () { location.href = url; }, true));
 }
 
+/* Neue Serie beim Lesen: Erst fragen, ob sie in den Hub soll und bis wohin du schon gelesen hast. Ohne Antwort geht ihr
+   Stand nicht in den Hub (token filtert), die Frage kommt beim nächsten Kapitel wieder. „Nein“ gilt für immer. */
+function askNew() {
+  var el = document.getElementById('mhub-ask');
+  var url = location.origin + path, key = isChapter() ? seriesKeyOf(url) : '';
+  if (!key || !GM_getValue(LIB, '') || libEntry(key) || newDecision(key) || askOff[key]) { if (el) el.remove(); return; }
+  if (el && el.getAttribute('data-k') === key) return;
+  if (el) el.remove();
+  var n = chOf(url), title = slugOfPath(path.toLowerCase()).replace(/[-_]+/g, ' ').replace(/\b\w/g, function (c) { return c.toUpperCase(); });
+  el = document.createElement('div'); el.id = 'mhub-ask'; el.setAttribute('data-k', key);
+  el.style.cssText = 'position:fixed;left:8px;right:8px;margin:0 auto;bottom:calc(60px + env(safe-area-inset-bottom, 0px));z-index:2147483647;max-width:460px;' +
+    'background:#1f1c2c;color:#ece9f6;border:1px solid #913fe2;border-radius:14px;padding:10px 12px;box-shadow:0 4px 18px rgba(0,0,0,.55);font:500 13px/1.35 system-ui,sans-serif';
+  var h = document.createElement('div'); h.style.cssText = 'font-weight:700;margin-bottom:2px;padding-right:22px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
+  h.textContent = L('Neu: ', 'New: ') + title;
+  var x = document.createElement('div'); x.setAttribute('role', 'button'); x.setAttribute('aria-label', L('Später', 'Later')); x.textContent = '×';
+  x.style.cssText = 'position:absolute;top:4px;right:10px;font-size:20px;cursor:pointer;color:#9893b0';
+  x.addEventListener('click', function (ev) { ev.stopPropagation(); askOff[key] = 1; el.remove(); });
+  var row = document.createElement('label'); row.style.cssText = 'display:flex;align-items:center;gap:8px;margin:6px 0 8px;color:#9893b0;font-size:12.5px';
+  row.appendChild(document.createTextNode(L('In deinen Hub? Gelesen bis Kapitel', 'Add to your hub? Read up to chapter')));
+  var inp = document.createElement('input'); inp.type = 'number'; inp.inputMode = 'decimal'; inp.min = '0'; inp.step = 'any';
+  inp.value = n != null ? String(Math.max(0, Math.ceil(n) - 1)) : '0';
+  inp.style.cssText = 'width:72px;padding:6px 8px;border-radius:8px;border:1px solid #322d45;background:#16151d;color:#fff;font:600 14px system-ui,sans-serif';
+  row.appendChild(inp);
+  var btns = document.createElement('div'); btns.style.cssText = 'display:flex;gap:8px';
+  var decide = function (ok) {
+    var q = get(NEWQ), r = parseFloat(String(inp.value).replace(',', '.'));
+    q[key] = { ok: ok, r: ok && isFinite(r) ? Math.max(0, r) : 0, t: Date.now() }; put(NEWQ, q);
+    el.remove(); flash(ok ? L('✓ Kommt in den Hub', '✓ Going to your hub') : L('Wird nicht übernommen', 'Not added'));
+  };
+  btns.appendChild(cardBtn(L('Übernehmen', 'Add'), function () { decide(true); }, true));
+  btns.appendChild(cardBtn(L('Nein', 'No'), function () { decide(false); }, false));
+  el.appendChild(x); el.appendChild(h); el.appendChild(row); el.appendChild(btns);
+  ['touchstart', 'touchend', 'click', 'keydown'].forEach(function (t) { el.addEventListener(t, function (ev) { ev.stopPropagation(); }); });
+  (document.body || document.documentElement).appendChild(el);
+}
+var askOff = {};
+
 function copyAll() {
   save(true);
   var t = token(true);
@@ -1870,6 +1936,7 @@ function route() {
 // Kapitelseite: Stand laden, Lesemodus aufbauen, an die Stelle springen
 function openChapter() {
   var sp = savedSpot(), target = sp.pct, anc = sp.anc;
+  setTimeout(askNew, 1500);
   startTiming(sp.e);
   var hm = location.hash.match(/mhub-(\d{1,3})/);
   if (hm) {
@@ -1900,6 +1967,7 @@ function openChapter() {
 }
 // Andere Seiten (Serienseite, Übersichten): Leiste zeigen, Karte mit Stand, Serien entdecken
 function openPage() {
+  askNew();
   pill.style.display = 'none'; cleanBtn.style.display = 'none';
   cardKey = ''; setTimeout(seriesCard, 800);
   clearTimeout(dockT); dock.style.opacity = '1'; dock.style.pointerEvents = 'auto';
