@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.43.0
+// @version      3.44.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.43.0';
+var VERSION = '3.44.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -97,7 +97,7 @@ function token(forClipboard) {
   var c = Object.keys(cv).filter(function (k) { return !cv[k].ack && (!forClipboard || (cv[k].sent || 0) < 2); })
     .map(function (k) { return { url: k, img: cv[k].img, title: cv[k].title, q: cv[k].q || 0 }; });
   var dd = get(DISC), d = Object.keys(dd).filter(function (k) { return !dd[k].ack; }).slice(0, forClipboard ? 30 : 150)
-    .map(function (k) { var e = dd[k]; return { url: k, title: e.title, rating: e.rating, ch: e.ch, chUrl: e.chUrl, img: e.img, site: e.site, g: e.g, desc: e.desc, type: e.type, rel: e.rel, ss: e.ss || '', q: e.q || 0, feat: e.feat || 0, alt: e.alt || [] }; });
+    .map(function (k) { var e = dd[k]; return { url: k, title: e.title, rating: e.rating, ch: e.ch, chUrl: e.chUrl, img: e.img, site: e.site, g: e.g, desc: e.desc, type: e.type, rel: e.rel, ss: e.ss || '', q: e.q || 0, feat: e.feat || 0, alt: e.alt || [], iu: e.iu || '' }; });
   var a = forClipboard ? [] : Object.keys(get(ADD));
   var rr = get('mhub_rate'), r = Object.keys(rr).map(function (k) { return { k: k, r: rr[k].r, t: rr[k].t }; });
   if (!p.length && !c.length && !d.length && !a.length && !r.length) return '';
@@ -235,9 +235,9 @@ if (isHub || topMode) {
         var ot = doc && doc.querySelector('meta[property="og:title"]');
         var og = doc && doc.querySelector('meta[property="og:image"],meta[name="twitter:image"]'), ogU = '';
         try { ogU = og && og.content ? new URL(og.content, j.page).href : ''; } catch (e) {}
-        var us = doc ? [docCoverUrl(doc, j.page, Math.round((j.w || COVER_W) * 1.5), ot && ot.content), ogU] : [], desc = doc ? fullDesc(doc) : '';
+        var us = (doc ? [docCoverUrl(doc, j.page, Math.round((j.w || COVER_W) * 1.5), ot && ot.content), ogU].concat(docMoreCovers(doc, j.page)) : []).concat(j.iu ? [j.iu] : []), desc = doc ? fullDesc(doc) : '';
         var done = function (img, w) { post('MHUB-COVEROK:' + JSON.stringify({ id: j.id, img: img || '', q: COVER_Q, dq: j.w >= 600 && w >= 570 ? 4 : 3, desc: desc })); setTimeout(next, 1200); };
-        shrinkAny(us, done, j.w);
+        shrinkAny(us, done, j.w, j.page);
       });
     })();
   };
@@ -1247,8 +1247,9 @@ function coverData(bmp, maxW) {
   return d;
 }
 // maxW: kleinere Vorschau (Entdecken). cb(Bild, Breite des Ergebnisses)
-function shrink(src, cb, maxW) {
-  GM_xmlhttpRequest({ method: 'GET', url: src, responseType: 'blob', timeout: 15000,
+// ref: Seite, von der das Bild stammt (manche Seiten liefern Bilder nur mit passendem Referer)
+function shrink(src, cb, maxW, ref) {
+  GM_xmlhttpRequest({ method: 'GET', url: src, responseType: 'blob', timeout: 15000, headers: ref ? { Referer: ref } : undefined,
     onload: function (res) {
       if (res.status !== 200 || !res.response) return cb('', 0);
       createImageBitmap(res.response).then(function (bmp) { cb(coverData(bmp, maxW), Math.min(maxW || COVER_W, bmp.width)); }).catch(function () { cb('', 0); });
@@ -1257,12 +1258,38 @@ function shrink(src, cb, maxW) {
 }
 // Mehrere mögliche Bildadressen der Reihe nach probieren, bis eine klappt (manche Seiten sperren das Original
 // hinter dem Bild-Proxy, manche Varianten gibt es nicht): erst die passende Größe, dann og:image, dann was die Seite zeigt
-function shrinkAny(list, cb, maxW) {
+function shrinkAny(list, cb, maxW, ref) {
   var seen = {}, urls = (list || []).filter(function (u) { if (!u || /^data:/.test(u) || seen[u]) return false; seen[u] = 1; return true; }), i = 0;
   (function next() {
     if (i >= urls.length) return cb('', 0);
-    shrink(urls[i++], function (d, w) { if (d) cb(d, w); else next(); }, maxW);
+    shrink(urls[i++], function (d, w) { if (d) cb(d, w); else next(); }, maxW, ref);
   })();
+}
+/* Weitere Stellen, an denen Seiten ihr Cover haben, wenn og:image fehlt (z. B. Seiten, die erst per JavaScript
+   aufgebaut werden, oder Cover als Hintergrundbild): itemprop/image_src, JSON-LD, Elemente mit „cover/thumb/poster“
+   in der Klasse (Bild darin oder Hintergrundbild), zuletzt eine Bildadresse in den Seitendaten. Ergebnis: Liste. */
+function bgUrl(el) {
+  var st = (el.getAttribute && (el.getAttribute('style') || '')) || '', m = st.match(/background(?:-image)?\s*:[^;]*url\(\s*['"]?([^'")]+)['"]?\s*\)/i);
+  return m ? m[1] : (el.getAttribute && (el.getAttribute('data-bg') || el.getAttribute('data-background') || el.getAttribute('data-bg-src'))) || '';
+}
+function docMoreCovers(doc, base) {
+  var abs = function (h) { try { return h && !/^data:/.test(h) ? new URL(h, base).href : ''; } catch (e) { return ''; } }, out = [];
+  var m1 = doc.querySelector('meta[itemprop="image"],link[rel="image_src"]'); if (m1) out.push(abs(m1.getAttribute('content') || m1.getAttribute('href')));
+  [].forEach.call(doc.querySelectorAll('script[type="application/ld+json"]'), function (sc) {
+    try { var o = JSON.parse(sc.textContent || ''), im = o && (o.image || (o['@graph'] && o['@graph'][0] && o['@graph'][0].image)); if (im) out.push(abs(typeof im === 'string' ? im : im.url || (im[0] && (im[0].url || im[0])))); } catch (e) {}
+  });
+  [].forEach.call(doc.querySelectorAll('[class*="cover"],[class*="thumb"],[class*="poster"],[class*="series-image"],[class*="summary_image"]'), function (el) {
+    if (out.length > 12) return;
+    var im = el.tagName === 'IMG' ? el : el.querySelector('img');
+    if (im) out.push(abs(im.getAttribute('data-src') || im.getAttribute('data-lazy-src') || im.getAttribute('src')));
+    out.push(abs(bgUrl(el)));
+  });
+  [].forEach.call(doc.querySelectorAll('script:not([src])'), function (sc) {
+    var t = sc.textContent || ''; if (t.length > 3000000) return;
+    var m = t.match(/\\?"(?:cover|coverImage|cover_url|thumbnail|thumb|poster)\\?"\s*:\s*\\?"(https?:[^"\\]+?\.(?:jpe?g|png|webp|avif)[^"\\]*)/i);
+    if (m) out.push(abs(m[1].replace(/\\\//g, '/')));
+  });
+  return out.filter(Boolean);
 }
 /* Passende Bildgröße wählen: aus srcset die kleinste Variante, die mindestens need Pixel breit ist (scharf nach dem
    Verkleinern, ohne riesige Originale zu laden), sonst die größte. Varianten: [{u, w}] */
@@ -1324,7 +1351,8 @@ function pageCoverUrls() {
     var sc = nw + (ogU && base(u) === base(ogU) ? 1e5 : 0) + (title && im.alt && normT(im.alt) === normT(title) ? 5e4 : 0);
     if (sc > bw) { bw = sc; best = u; shown = im.currentSrc || im.src || ''; }
   });
-  return [best, shown, ogU, og && og.content];
+  // Kein passendes <img>: Hintergrundbilder und weitere Stellen (Klasse cover/thumb/poster, JSON-LD, Seitendaten)
+  return [best, shown, ogU, og && og.content].concat(docMoreCovers(document, location.href));
 }
 function grabCover(force) {
   var key = location.origin + location.pathname, all = get(COV);
@@ -1335,7 +1363,7 @@ function grabCover(force) {
     if (!d) { if (force) flash(L('Cover ließ sich nicht laden', 'Cover could not be loaded')); return; }
     var cur = get(COV); cur[key] = { img: d, title: t ? t.content : document.title, t: Date.now(), q: COVER_Q };
     put(COV, keep(cur, 40)); if (force) flash(L('✓ Cover gemerkt', '✓ Cover saved'));
-  });
+  }, undefined, location.href);
 }
 /* ---------- Entdecken: Serien auf Übersichtsseiten einsammeln ---------- */
 function absUrl(href, base) { try { return new URL(href, base || location.href).href.replace(/[#?].*$/, ''); } catch (e) { return ''; } }
@@ -1391,6 +1419,8 @@ function scrapeCards() {
     card = card || as[0];
     // Titel: Überschrift der Karte, sonst title-Attribut, Alt-Text des Bildes, sonst der längste Linktext (gesäubert)
     var img = card.tagName === 'IMG' ? card : card.querySelector('img'), title = '';
+    // Ohne <img>: Cover als Hintergrundbild der Karte (manche Seiten)
+    var bg = ''; if (!img && card.querySelectorAll) { var bgEl = [card].concat([].slice.call(card.querySelectorAll('[style*="background"],[data-bg],[data-background]'))).filter(function (x) { return bgUrl(x); })[0]; if (bgEl) bg = absUrl(bgUrl(bgEl)); }
     var head = card.querySelector && card.querySelector('h1,h2,h3,h4,h5,[class*="title"],[class*="name"]');
     var cands = [head ? spacedText(head) : ''];
     as.forEach(function (a) { cands.push(a.getAttribute('title') || ''); });
@@ -1410,7 +1440,7 @@ function scrapeCards() {
     // Steht die Karte in einem Slider/Karussell (oben auf der Startseite der Scan-Seite), ist sie gerade hervorgehoben
     var feat = !!(card.closest && card.closest(FEAT_SEL));
     out.push({ url: k, title: title.slice(0, 120), rating: rating, ch: chN, chUrl: chU, type: type, feat: feat,
-      imgSrc: img ? fitSrc(img, feat ? 900 : 600) : '', imgRaw: img ? (img.currentSrc || img.src || img.getAttribute('data-src') || '') : '' });
+      imgSrc: img ? fitSrc(img, feat ? 900 : 600) : bg, imgRaw: img ? (img.currentSrc || img.src || img.getAttribute('data-src') || '') : '' });
   });
   return out;
 }
@@ -1461,7 +1491,10 @@ function fromDoc(c, doc, cb) {
   // Quelle in passender Größe (docCoverUrl), sonst das Bild der Karte
   // Klappt eine Adresse nicht (gesperrt, nicht da), die nächste: so fehlt kein Bild mehr
   var big = !!c.feat, ogU = ''; try { ogU = og && og.content ? new URL(og.content, c.url).href : ''; } catch (er) {}
-  shrinkAny([doc && docCoverUrl(doc, c.url, big ? 900 : 600, e.title), ogU, c.imgSrc, c.imgRaw], function (d, w) { e.img = d; e.q = d ? (big && w >= 570 ? 4 : 3) : 0; cb(e); }, big ? 600 : 400);
+  // Woher das Bild kam, merken (iu): damit kann der Hub es später neu holen lassen, auch wenn die Seite kein og:image hat
+  var cands = [doc && docCoverUrl(doc, c.url, big ? 900 : 600, e.title), ogU, c.imgSrc, c.imgRaw].concat(doc ? docMoreCovers(doc, c.url) : []);
+  e.iu = c.imgSrc || c.imgRaw || '';
+  shrinkAny(cands, function (d, w) { e.img = d; e.q = d ? (big && w >= 570 ? 4 : 3) : 0; cb(e); }, big ? 600 : 400, c.url);
 }
 // Art (Manhwa, Novel …) aus einem Abzeichen lesen: ein Element, dessen Text genau so heißt
 function badgeType(root) {
@@ -1774,13 +1807,24 @@ function altNames(root) {
   // 2. Element mit „alternative“/„alt-name“ in der Klasse
   if (!raw.length) { var c = root.querySelector('[class*="alternative"],[class*="alt-name"],[class*="altname"],[class*="alt_title"]'); if (c && (c.textContent || '').length < 700) raw.push((c.textContent || '').replace(ALT_LABEL, '')); }
   // 3. Zeile direkt unter dem Titel mit mehreren durch • getrennten Namen (Asura)
-  // Nur, wenn es nach Namen aussieht: jeder Teil kurz und nicht kleingeschrieben (kein Fließtext mit •)
-  var looksList = function (t) { var ps = t.split(/\s*[•·]\s*/); return ps.length >= 2 && ps.every(function (x) { return x && x.length <= 120 && !/^[a-z]/.test(x); }); };
+  // 3. Zeile direkt über oder unter dem Titel mit mehreren Namen: mit „•“ getrennt (Asura) oder mit Komma (Vortex: über dem
+  //    Titel „대마법사 커리큘럼, The Archmage Curriculum“). Nur, wenn es nach Namen aussieht: jeder Teil kurz, nicht klein
+  //    anfangend, kein Satz (kein Fließtext)
+  var looksList = function (t, sep) {
+    var ps = t.split(sep); if (ps.length < 2 || t.length > 500 || /[.!?]\s+\S/.test(t)) return false;
+    return ps.every(function (x) { return x && x.length <= 120 && !/^[a-z]/.test(x); });
+  };
+  var tryLine = function (el) {
+    if (raw.length || !el || el === h1 || el.querySelector && el.querySelector('h1')) return;
+    var t = (el.textContent || '').replace(/\s+/g, ' ').replace(/[\s^˄˅▲▼⌃⌄›»]+$/, '').trim();
+    if (!t || t.length > 500) return;
+    if (/\s[•·]\s/.test(t) && looksList(t, /\s*[•·]\s*/)) raw.push(t);
+    else if (/,\s/.test(t) && looksList(t, /\s*,\s+/)) { raw.push(t); comma = true; }
+  };
   if (!raw.length && h1) {
-    for (var el = h1.nextElementSibling, i = 0; el && i < 3 && !raw.length; el = el.nextElementSibling, i++) {
-      var t3 = (el.textContent || '').trim(); if (t3.length < 700 && /\s[•·]\s/.test(t3) && looksList(t3)) raw.push(t3);
-    }
-    if (!raw.length && h1.parentElement) [].forEach.call(h1.parentElement.children, function (el) { var t4 = (el.textContent || '').trim(); if (!raw.length && el !== h1 && t4.length < 700 && /\s[•·]\s/.test(t4) && looksList(t4)) raw.push(t4); });
+    for (var el = h1.previousElementSibling, i = 0; el && i < 2; el = el.previousElementSibling, i++) tryLine(el);
+    for (el = h1.nextElementSibling, i = 0; el && i < 3; el = el.nextElementSibling, i++) tryLine(el);
+    if (!raw.length && h1.parentElement) [].forEach.call(h1.parentElement.children, tryLine);
   }
   var out = [], seen = {};
   // Getrennt mit • ; | / oder Zeilen; bei einer Beschriftung ohne diese Zeichen auch mit Komma („A, B, C“)
