@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.35.0
+// @version      3.36.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.35.0';
+var VERSION = '3.36.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -264,7 +264,11 @@ if (isHub || topMode) {
     GM_addValueChangeListener(ADD, function (n, o, v, remote) { if (remote) send(); });
     GM_addValueChangeListener('mhub_rate', function (n, o, v, remote) { if (remote) send(); });
   }
-  if (isHub) { post('MHUB-CORE:' + VERSION); send(); }
+  if (isHub) {
+    post('MHUB-CORE:' + VERSION); send();
+    // Hub auf dem eigenen Server: der Hub-Knopf beim Lesen führt dorthin
+    if (location.protocol === 'https:' && !/(^|\.)(claude\.ai|claudeusercontent\.com)$/.test(location.hostname)) GM_setValue('mhub_home', location.origin + location.pathname);
+  }
   else {
     // Alle Rahmen der Claude-Seite anpingen, bis sich der Hub meldet
     var ping = function (w, depth) {
