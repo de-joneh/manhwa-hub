@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.32.0
+// @version      3.33.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.32.0';
+var VERSION = '3.33.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -232,6 +232,7 @@ if (isHub || topMode) {
       post('MHUB-SITES-OK');
     }
     else if (d.indexOf('MHUB-LIB:') === 0) { GM_setValue(LIB, d.slice(9)); }
+    else if (d.indexOf('MHUB-KNOWN:') === 0) GM_setValue('mhub_known', d.slice(11));
     else if (d.indexOf('MHUB-ACK:') === 0) {
       try {
         var urls = JSON.parse(d.slice(9)), cv = get(COV), dv = get(DISC), ad = get(ADD), ch = false, ch2 = false, ch3 = false;
@@ -598,7 +599,7 @@ function prepareReader(cb) {
 var DESK = !!(window.matchMedia && matchMedia('(pointer: fine)').matches);
 function prefs() {
   var p = {}; try { p = JSON.parse(GM_getValue('mhub_prefs', '{}')) || {}; } catch (e) {}
-  return { auto: p.auto || 'key', speed: p.speed || 2, wheel: +p.wheel || 1, click: p.click !== false, swipe: p.swipe !== false, preload: p.preload !== false, width: +p.width || 820, endless: p.endless !== false };
+  return { auto: p.auto || 'key', speed: p.speed || 2, wheel: +p.wheel || 1, click: p.click !== false, swipe: p.swipe !== false, preload: p.preload !== false, width: +p.width || 820, endless: p.endless !== false, save: p.save === true };
 }
 // Bildbreite im Modus „Nur Bilder“ (Regler im Hub). 1600 heißt: volle Breite
 function applyWidth() {
@@ -728,7 +729,7 @@ function fetchChapter(u) {
     e.imgs = imgs; e.doc = doc; e.state = imgs.length >= 3 ? 'ok' : 'none';
     // Bilder dort vorladen, wo du weiterlesen würdest
     var a = ancFor(u, imgs), from = a ? Math.max(0, a.i - 1) : 0;
-    if (e.state === 'ok' && prefs().preload) imgs.slice(from, from + 4).forEach(function (src) { var im = new Image(); im.decoding = 'async'; im.src = src; });
+    if (e.state === 'ok' && prefs().preload && !prefs().save) imgs.slice(from, from + 4).forEach(function (src) { var im = new Image(); im.decoding = 'async'; im.src = src; });
     fin();
   }).catch(function () { e.state = 'none'; fin(); });
   // Höchstens 8 Kapitel merken
@@ -1273,47 +1274,52 @@ function scrapeCards() {
   });
   return out;
 }
+// Fund mit Details anreichern: Serienseite holen (oder, wenn du gerade darauf bist, die offene Seite nehmen)
 function enrich(c, cb) {
-  var base = slugBase(c.url);
+  if (c.url === (location.origin + location.pathname).replace(/\/$/, '')) return fromDoc(c, document, cb);
   GM_xmlhttpRequest({ method: 'GET', url: c.url, timeout: 15000,
     onload: function (r) {
       var doc = null;
       try { if (r.status === 200) doc = new DOMParser().parseFromString(r.responseText, 'text/html'); } catch (e) {}
-      var og = doc && doc.querySelector('meta[property="og:image"]'), ot = doc && doc.querySelector('meta[property="og:title"]');
-      var e = { title: (ot && ot.content) || c.title, rating: c.rating, ch: c.ch, chUrl: c.chUrl, img: '', site: location.hostname, t: Date.now(), feat: c.feat ? Date.now() : 0,
-        g: [], desc: '', type: c.type || '', rel: [] };
-      if (doc) {
-        var seen = {}, rel = {};
-        doc.querySelectorAll('a[href]').forEach(function (a) {
-          var hrf = (a.getAttribute('href') || '').toLowerCase();
-          var u = absUrl(a.getAttribute('href'), c.url), n = chOf(u);
-          if (n != null && pathOf(u).toLowerCase().indexOf(base) > -1) {
-            if (e.ch == null || n > e.ch) { e.ch = n; e.chUrl = u; }
-            var dt = linkDate(a);
-            if (dt && !rel[n]) rel[n] = dt;
-            return;
-          }
-          if (/(genre|genres|tag|tags)[\/=]/.test(hrf) && !a.closest('nav,header,footer,[class*="menu"],[id*="menu"]')) {
-            var t = (a.textContent || '').replace(/\s+/g, ' ').trim();
-            if (t && t.length < 30 && !seen[t.toLowerCase()] && e.g.length < 12) { seen[t.toLowerCase()] = 1; e.g.push(t); }
-          }
-        });
-        e.rel = Object.keys(rel).map(function (n) { return [parseFloat(n), rel[n]]; }).sort(function (a, b) { return a[0] - b[0]; }).slice(-20);
-        e.desc = fullDesc(doc);
-        e.g = mergeGenres(headGenres(doc), e.g);
-        var bt = doc.body ? (doc.body.textContent || '').slice(0, 40000) : '';
-        var ty = bt.match(/(?:type|typ)\s*:?\s*(manhwa|manga|manhua|novel|webtoon)/i);
-        if (ty) e.type = ty[1].charAt(0).toUpperCase() + ty[1].slice(1).toLowerCase();
-        else if (!e.type) e.type = badgeType(doc.body);
-        if (!e.type && /\/novels?\//i.test(c.url)) e.type = 'Novel';
-        e.ss = siteStatus(doc);
-      }
-      var src = (og && og.content) || c.imgSrc;
-      if (!src || /^data:/.test(src)) return cb(e);
-      // 400 px breit: scharf in der Entdecken-Leiste auch bei hoher Pixeldichte
-      shrink(src, function (d) { e.img = d; e.q = d ? 2 : 0; cb(e); }, 400);
+      fromDoc(c, doc, cb);
     },
     onerror: function () { cb(null); }, ontimeout: function () { cb(null); } });
+}
+function fromDoc(c, doc, cb) {
+  var base = slugBase(c.url);
+  var og = doc && doc.querySelector('meta[property="og:image"]'), ot = doc && doc.querySelector('meta[property="og:title"]');
+  var e = { title: (ot && ot.content) || c.title, rating: c.rating, ch: c.ch, chUrl: c.chUrl, img: '', site: location.hostname, t: Date.now(), feat: c.feat ? Date.now() : 0,
+    g: [], desc: '', type: c.type || '', rel: [] };
+  if (doc) {
+    var seen = {}, rel = {};
+    doc.querySelectorAll('a[href]').forEach(function (a) {
+      var hrf = (a.getAttribute('href') || '').toLowerCase();
+      var u = absUrl(a.getAttribute('href'), c.url), n = chOf(u);
+      if (n != null && pathOf(u).toLowerCase().indexOf(base) > -1) {
+        if (e.ch == null || n > e.ch) { e.ch = n; e.chUrl = u; }
+        var dt = linkDate(a);
+        if (dt && !rel[n]) rel[n] = dt;
+        return;
+      }
+      if (/(genre|genres|tag|tags)[\/=]/.test(hrf) && !a.closest('nav,header,footer,[class*="menu"],[id*="menu"]')) {
+        var t = (a.textContent || '').replace(/\s+/g, ' ').trim();
+        if (t && t.length < 30 && !seen[t.toLowerCase()] && e.g.length < 12) { seen[t.toLowerCase()] = 1; e.g.push(t); }
+      }
+    });
+    e.rel = Object.keys(rel).map(function (n) { return [parseFloat(n), rel[n]]; }).sort(function (a, b) { return a[0] - b[0]; }).slice(-20);
+    e.desc = fullDesc(doc);
+    e.g = mergeGenres(headGenres(doc), e.g);
+    var bt = doc.body ? (doc.body.textContent || '').slice(0, 40000) : '';
+    var ty = bt.match(/(?:type|typ)\s*:?\s*(manhwa|manga|manhua|novel|webtoon)/i);
+    if (ty) e.type = ty[1].charAt(0).toUpperCase() + ty[1].slice(1).toLowerCase();
+    else if (!e.type) e.type = badgeType(doc.body);
+    if (!e.type && /\/novels?\//i.test(c.url)) e.type = 'Novel';
+    e.ss = siteStatus(doc);
+  }
+  var src = (og && og.content) || c.imgSrc;
+  if (!src || /^data:/.test(src)) return cb(e);
+  // 400 px breit: scharf in der Entdecken-Leiste auch bei hoher Pixeldichte
+  shrink(src, function (d) { e.img = d; e.q = d ? 2 : 0; cb(e); }, 400);
 }
 // Art (Manhwa, Novel …) aus einem Abzeichen lesen: ein Element, dessen Text genau so heißt
 function badgeType(root) {
@@ -1405,6 +1411,17 @@ function queueSelf(self) {
   discSeen[self] = 1; discQ.unshift({ url: self, title: document.title, rating: null, ch: null, chUrl: null, imgSrc: '' });
   return true;
 }
+// Ohne Abruf: was die Karte selbst zeigt. Für Serien, die der gemeinsame Pool schon vollständig kennt (mhub_known),
+// und im Datensparmodus (außer hervorgehobene). Bild und Beschreibung kommen dann aus dem Pool
+function lightEntry(c) {
+  return { title: c.title, rating: c.rating, ch: c.ch, chUrl: c.chUrl, img: '', site: location.hostname, t: Date.now(), feat: c.feat ? Date.now() : 0, g: [], desc: '', type: c.type || '', rel: [] };
+}
+var knownRaw = '', knownSet = {};
+function isKnown(u) {
+  var raw = GM_getValue('mhub_known', '[]');
+  if (raw !== knownRaw) { knownRaw = raw; knownSet = {}; try { (JSON.parse(raw) || []).forEach(function (x) { knownSet[x] = 1; }); } catch (e) {} }
+  return !!knownSet[u];
+}
 function runDisc() {
   discBusy = true;
   var done = 0;
@@ -1412,10 +1429,9 @@ function runDisc() {
     if (!discQ.length || document.hidden) { discBusy = false; if (done) flash('✓ ' + done + L(' Manhwas für den Hub gemerkt', ' manhwas saved for the hub')); return; }
     var c = discQ.shift();
     flash(L('🔎 Entdecke … noch ', '🔎 Discovering … ') + (discQ.length + 1) + L('', ' left'));
-    enrich(c, function (e) {
-      if (e) { var all = get(DISC); all[c.url] = e; put(DISC, keep(all, 150)); done++; }
-      setTimeout(next, 600);
-    });
+    var store = function (e) { if (e) { var all = get(DISC); all[c.url] = e; put(DISC, keep(all, 150)); done++; } };
+    if (isKnown(c.url) || (prefs().save && !c.feat)) { store(lightEntry(c)); return setTimeout(next, 50); }
+    enrich(c, function (e) { store(e); setTimeout(next, 600); });
   })();
 }
 function discover() {
