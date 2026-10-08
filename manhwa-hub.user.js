@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.37.0
+// @version      3.38.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.37.0';
+var VERSION = '3.38.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -31,6 +31,25 @@ var SERIES = /\/(?:series|manga|manhwa|manhua|comics?|title|webtoon|novels?)\/[^
 // Cover: Zielgröße und Qualitätsstufe (ältere Stufen werden einmal neu geholt). Hier oben, weil auch der Hub-Teil sie braucht
 var COVER_W = 600, COVER_H = 800, COVER_Q = 2;
 var LOG = 'mhub_log', COV = 'mhub_cov', DISC = 'mhub_disc', LIB = 'mhub_lib', ADD = 'mhub_add';
+/* Konstanten, die auch der Hub-Teil (01-hub) braucht: Er endet mit return, bevor die übrigen Dateien ihre var-Zeilen
+   ausführen. Funktionen sind dort überall nutzbar (hoisting), Variablen nur, wenn sie hier oben stehen. */
+var CHNUM = /(?:chapter|chap|ch|episode|ep)[-_\/ .]?(\d+(?:[-_.]\d+)?)/;
+var MON = { jan: 0, feb: 1, mar: 2, 'mär': 2, mae: 2, apr: 3, may: 4, mai: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, okt: 9, nov: 10, dec: 11, dez: 11 };
+var UNIT = [[/^(s|sec|secs|second|seconds|sek|sekunde|sekunden)$/, 1e3], [/^(m|min|mins|minute|minutes|minuten)$/, 6e4], [/^(h|hr|hrs|hour|hours|std|stunde|stunden)$/, 36e5],
+  [/^(d|day|days|tag|tage|tagen)$/, 864e5], [/^(w|wk|wks|week|weeks|woche|wochen)$/, 6048e5], [/^(mo|mon|mons|month|months|monat|monate|monaten)$/, 2592e6], [/^(y|yr|yrs|year|years|jahr|jahre|jahren)$/, 31536e6]];
+// Text-Hilfen für Beschreibungen (10-serieninfo): „Mehr anzeigen“-Knöpfe, Status-Wörter
+var MORE_RE = /^(?:\.\.\.|…)?\s*(?:(?:read|show|see|view)\s+(?:more|less|all|full)|mehr(?:\s+anzeigen)?|weniger(?:\s+anzeigen)?|expand|collapse|\+\s*more)\s*(?:»|›|>|▼|▲)?$/i;
+var STATUS_WORDS = [[/\b(completed?|finished|ended|abgeschlossen|beendet)\b/i, 'done'], [/\b(hiatus|on.?hold|paused|pausiert|season end)\b/i, 'hiatus'],
+  [/\b(dropped|cancell?ed|discontinued|abgebrochen|eingestellt)\b/i, 'dropped'], [/\b(ongoing|on.?going|publishing|releasing|laufend)\b/i, 'ongoing']];
+function cutEnd(t) { return /(\.\.\.|…)\s*$/.test(t); }
+function hostOf(u) { try { return new URL(u).hostname; } catch (e) { return ''; } }
+// Datensparmodus aus den Lese-Einstellungen (ohne prefs() aus 04-pc, das im Hub-Teil nicht läuft)
+function saveMode() { try { return (JSON.parse(GM_getValue('mhub_prefs', '{}')) || {}).save === true; } catch (e) { return false; } }
+/* Warteschlange zum Entdecken (Seiten, die noch abgerufen werden müssen), im Tampermonkey-Speicher: überlebt das
+   Weiterblättern und wird auf der nächsten Scan-Seite oder im offenen Hub weiter abgearbeitet. */
+var DQ = 'mhub_discq', dqBusy = false, dqSendT = 0, DISC_KEEP = 300;
+function dqGet() { try { var a = JSON.parse(GM_getValue(DQ, '[]')); return Array.isArray(a) ? a : []; } catch (e) { return []; } }
+function dqPut(a) { GM_setValue(DQ, JSON.stringify(a.slice(0, 400))); }
 
 function get(k) { try { return JSON.parse(GM_getValue(k, '{}')) || {}; } catch (e) { return {}; } }
 // Sprache kommt vom Hub (MHUB-LANG)
@@ -269,6 +288,11 @@ if (isHub || topMode) {
     post('MHUB-CORE:' + VERSION); send();
     // Hub auf dem eigenen Server: der Hub-Knopf beim Lesen führt dorthin
     if (location.protocol === 'https:' && !/(^|\.)(claude\.ai|claudeusercontent\.com)$/.test(location.hostname)) GM_setValue('mhub_home', location.origin + location.pathname);
+    // Was beim Stöbern noch nicht abgerufen wurde, hier im offenen Hub weiter abarbeiten
+    var dqKick = function () { if (!document.hidden && dqGet().length) runDisc(); };
+    setTimeout(dqKick, 3000);
+    document.addEventListener('visibilitychange', dqKick);
+    if (GM_addValueChangeListener) GM_addValueChangeListener(DQ, function (n, o, v, remote) { if (remote) setTimeout(dqKick, 2000); });
   }
   else {
     // Alle Rahmen der Claude-Seite anpingen, bis sich der Hub meldet
@@ -290,7 +314,7 @@ if (!SITES.some(function (s) { return s && location.hostname.indexOf(s) > -1; })
 var path = '', cur = 0, box = null, imgCount = -1, dirty = false, lastWrite = 0, flashUntil = 0, queued = false, restoring = false, touched = false;
 var bigImgs = [], curA = null, REF = 0.3;
 var savedT = 0, savedA = null;
-var hideT = 0, discT = 0, discQ = [], discBusy = false, discSeen = {};
+var hideT = 0, discT = 0, discSeen = {};
 function isChapter() { return CH.test(path.toLowerCase()); }
 
 var dock = document.createElement('div');
@@ -1279,7 +1303,6 @@ function grabCover(force) {
   });
 }
 /* ---------- Entdecken: Serien auf Übersichtsseiten einsammeln ---------- */
-var CHNUM = /(?:chapter|chap|ch|episode|ep)[-_\/ .]?(\d+(?:[-_.]\d+)?)/;
 function absUrl(href, base) { try { return new URL(href, base || location.href).href.replace(/[#?].*$/, ''); } catch (e) { return ''; } }
 function pathOf(u) { try { return new URL(u).pathname; } catch (e) { return ''; } }
 function slugBase(u) {
@@ -1353,7 +1376,7 @@ function enrich(c, cb) {
 function fromDoc(c, doc, cb) {
   var base = slugBase(c.url);
   var og = doc && doc.querySelector('meta[property="og:image"]'), ot = doc && doc.querySelector('meta[property="og:title"]');
-  var e = { title: (ot && ot.content) || c.title, rating: c.rating, ch: c.ch, chUrl: c.chUrl, img: '', site: location.hostname, t: Date.now(), feat: c.feat ? Date.now() : 0,
+  var e = { title: (ot && ot.content) || c.title, rating: c.rating, ch: c.ch, chUrl: c.chUrl, img: '', site: hostOf(c.url) || location.hostname, t: Date.now(), feat: c.feat ? Date.now() : 0,
     g: [], desc: '', type: c.type || '', rel: [] };
   if (doc) {
     var seen = {}, rel = {};
@@ -1401,9 +1424,6 @@ function badgeType(root) {
 // Datum aus dem Text eines Kapitel-Links lesen. Versteht absolute Angaben ("October 3rd 2025", "Oct 3, 2025",
 // "3. Oktober 2025", "03.10.2025", "2025-10-03", "Oct 3"), relative ("5 days ago", "vor 2 Stunden", "yesterday")
 // und <time datetime>. Ergebnis ist der Tag (12 Uhr), damit sich der Wert innerhalb eines Tages nicht ändert.
-var MON = { jan: 0, feb: 1, mar: 2, 'mär': 2, mae: 2, apr: 3, may: 4, mai: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, okt: 9, nov: 10, dec: 11, dez: 11 };
-var UNIT = [[/^(s|sec|secs|second|seconds|sek|sekunde|sekunden)$/, 1e3], [/^(m|min|mins|minute|minutes|minuten)$/, 6e4], [/^(h|hr|hrs|hour|hours|std|stunde|stunden)$/, 36e5],
-  [/^(d|day|days|tag|tage|tagen)$/, 864e5], [/^(w|wk|wks|week|weeks|woche|wochen)$/, 6048e5], [/^(mo|mon|mons|month|months|monat|monate|monaten)$/, 2592e6], [/^(y|yr|yrs|year|years|jahr|jahre|jahren)$/, 31536e6]];
 function unitMs(u) { for (var i = 0; i < UNIT.length; i++) if (UNIT[i][0].test(u)) return UNIT[i][1]; return 0; }
 function dayOf(t) { var d = new Date(t); d.setHours(12, 0, 0, 0); return d.getTime(); }
 function parseDate(txt) {
@@ -1469,18 +1489,18 @@ function refreshRel() {
   if (ss) e.ss = ss;
   if (mx > (e.ch || 0)) { e.ch = mx; e.chUrl = mxU; }
   e.relSig = sig; e.ack = false; e.t = Date.now();
-  put(DISC, keep(all, 150));
+  put(DISC, keep(all, DISC_KEEP));
 }
 // Diese Serienseite selbst zum Entdecken vormerken (vorne in der Warteschlange)
 function queueSelf(self) {
   if (discSeen[self]) return false;
-  discSeen[self] = 1; discQ.unshift({ url: self, title: document.title, rating: null, ch: null, chUrl: null, imgSrc: '' });
+  discSeen[self] = 1; dqAdd([{ url: self, title: document.title, rating: null, ch: null, chUrl: null, imgSrc: '' }], true);
   return true;
 }
 // Ohne Abruf: was die Karte selbst zeigt. Für Serien, die der gemeinsame Pool schon vollständig kennt (mhub_known),
 // und im Datensparmodus (außer hervorgehobene). Bild und Beschreibung kommen dann aus dem Pool
 function lightEntry(c) {
-  return { title: c.title, rating: c.rating, ch: c.ch, chUrl: c.chUrl, img: '', site: location.hostname, t: Date.now(), feat: c.feat ? Date.now() : 0, g: [], desc: '', type: c.type || '', rel: [] };
+  return { title: c.title, rating: c.rating, ch: c.ch, chUrl: c.chUrl, img: '', site: hostOf(c.url) || location.hostname, t: Date.now(), feat: c.feat ? Date.now() : 0, g: [], desc: '', type: c.type || '', rel: [] };
 }
 var knownRaw = '', knownSet = {};
 function isKnown(u) {
@@ -1488,22 +1508,42 @@ function isKnown(u) {
   if (raw !== knownRaw) { knownRaw = raw; knownSet = {}; try { (JSON.parse(raw) || []).forEach(function (x) { knownSet[x] = 1; }); } catch (e) {} }
   return !!knownSet[u];
 }
+// Kurzer Hinweis unten in der Leiste, nur auf Scan-Seiten (im Hub gibt es die Leiste nicht)
+function discNote(t) { if (!isHub && !topMode && typeof flash === 'function' && typeof pill !== 'undefined' && pill) flash(t); }
+// Ergebnis ablegen: den schnellen Eintrag (von der Karte) durch den vollständigen ersetzen, Hervorhebung behalten
+function discStore(url, e) {
+  var all = get(DISC), old = all[url];
+  if (old && old.feat && !e.feat) e.feat = old.feat;
+  e.ack = false; all[url] = e; put(DISC, keep(all, DISC_KEEP));
+  // Im Hub selbst kommt die Änderung nicht über den Speicher-Listener: gesammelt melden
+  if (isHub && typeof send === 'function') { clearTimeout(dqSendT); dqSendT = setTimeout(send, 1500); }
+}
+/* Warteschlange abarbeiten: Serienseite holen, Details und Bild dazu. Läuft auf Scan-Seiten und im offenen Hub,
+   pausiert, wenn die Seite nicht zu sehen ist, und macht beim nächsten Mal weiter (DQ im Tampermonkey-Speicher). */
 function runDisc() {
-  discBusy = true;
+  if (dqBusy) return;
+  dqBusy = true;
   var done = 0;
   (function next() {
-    if (!discQ.length || document.hidden) { discBusy = false; if (done) flash('✓ ' + done + L(' Manhwas für den Hub gemerkt', ' manhwas saved for the hub')); return; }
-    var c = discQ.shift();
-    flash(L('🔎 Entdecke … noch ', '🔎 Discovering … ') + (discQ.length + 1) + L('', ' left'));
-    var store = function (e) { if (e) { var all = get(DISC); all[c.url] = e; put(DISC, keep(all, 150)); done++; } };
-    if (isKnown(c.url) || (prefs().save && !c.feat)) { store(lightEntry(c)); return setTimeout(next, 50); }
-    enrich(c, function (e) { store(e); setTimeout(next, 600); });
+    var q = dqGet();
+    if (!q.length || document.hidden) { dqBusy = false; if (done) discNote('✓ ' + done + L(' Manhwas für den Hub gemerkt', ' manhwas saved for the hub')); return; }
+    var c = q.shift(); dqPut(q);
+    if (q.length % 5 === 0) discNote(L('🔎 Entdecke … noch ', '🔎 Discovering … ') + (q.length + 1) + L('', ' left'));
+    enrich(c, function (e) { if (e) { discStore(c.url, e); done++; } setTimeout(next, 600); });
   })();
+}
+// In die Warteschlange (vorne: die gerade offene Serienseite), ohne doppelte
+function dqAdd(cards, front) {
+  var q = dqGet(), have = {};
+  q.forEach(function (c) { have[c.url] = 1; });
+  var add = cards.filter(function (c) { if (have[c.url]) return false; have[c.url] = 1; return true; });
+  if (!add.length) return;
+  dqPut(front ? add.concat(q) : q.concat(add));
 }
 function discover() {
   if (isChapter()) return;
   siteProgress();
-  var cards = scrapeCards(), all = get(DISC), changed = false;
+  var cards = scrapeCards(), all = get(DISC), changed = false, todo = [], save = saveMode();
   cards.forEach(function (c) {
     var e = all[c.url];
     if (e) {
@@ -1517,15 +1557,19 @@ function discover() {
       return;
     }
     if (discSeen[c.url]) return;
-    discSeen[c.url] = 1; discQ.push(c);
+    discSeen[c.url] = 1;
+    // Sofort melden, was die Karte zeigt (Titel, Wertung, Kapitel): so geht beim schnellen Weiterblättern nichts verloren.
+    // Details und Bild holt die Warteschlange danach (außer der Pool kennt die Serie schon, oder Datensparmodus)
+    all[c.url] = lightEntry(c); changed = true;
+    if (!isKnown(c.url) && !(save && !c.feat)) todo.push(c);
   });
-  if (changed) put(DISC, keep(all, 150));
-  if (discQ.length && !discBusy) runDisc();
+  if (changed) put(DISC, keep(all, DISC_KEEP));
+  if (todo.length) dqAdd(todo.map(function (c) { return { url: c.url, title: c.title, rating: c.rating, ch: c.ch, chUrl: c.chUrl, type: c.type, feat: c.feat, imgSrc: c.imgSrc, imgRaw: c.imgRaw }; }), false);
+  if (dqGet().length) runDisc();
 }
 
 /* ---------- Beschreibung und Genres von der Serienseite ---------- */
 // Text mit Absätzen: Blöcke und <br> werden zu Zeilenumbrüchen. „Mehr anzeigen“-Knöpfe und -Links gehören nicht dazu
-var MORE_RE = /^(?:\.\.\.|…)?\s*(?:(?:read|show|see|view)\s+(?:more|less|all|full)|mehr(?:\s+anzeigen)?|weniger(?:\s+anzeigen)?|expand|collapse|\+\s*more)\s*(?:»|›|>|▼|▲)?$/i;
 function blockText(el) {
   var out = '';
   (function walk(n) {
@@ -1541,7 +1585,6 @@ function blockText(el) {
   return out.replace(/[ \t ]+/g, ' ').replace(/ *\n */g, '\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 function normT(t) { return String(t || '').replace(/\s+/g, ' ').trim().toLowerCase(); }
-var cutEnd = function (t) { return /(\.\.\.|…)\s*$/.test(t); };
 // Text, der als HTML kommt (<p>…</p> in JSON): in Absätze umwandeln
 function htmlText(t) {
   if (!/<[a-z\/][^>]*>|&[a-z#0-9]+;/i.test(t)) return t;
@@ -1680,8 +1723,6 @@ function mergeGenres(a, b) {
 }
 // Status der Serie auf der Seite („Status: Ongoing / Completed / Hiatus / Dropped“), auch als Beschriftung mit Wert daneben.
 // Ergebnis: ongoing, done, hiatus, dropped oder ''
-var STATUS_WORDS = [[/\b(completed?|finished|ended|abgeschlossen|beendet)\b/i, 'done'], [/\b(hiatus|on.?hold|paused|pausiert|season end)\b/i, 'hiatus'],
-  [/\b(dropped|cancell?ed|discontinued|abgebrochen|eingestellt)\b/i, 'dropped'], [/\b(ongoing|on.?going|publishing|releasing|laufend)\b/i, 'ongoing']];
 function siteStatus(root) {
   // Text mit Leerzeichen zwischen den Teilen, sonst wird aus „Status“ + „Completed“ ein Wort
   var spaced = function (el) { var w = el.ownerDocument.createTreeWalker(el, 4), out = [], n; while ((n = w.nextNode())) out.push(n.nodeValue); return out.join(' ').replace(/\s+/g, ' ').trim(); };
@@ -1772,7 +1813,7 @@ function seriesCard() {
     if (!adds[self]) card.appendChild(cardBtn(L('+ Zum Hub', '+ Add to hub'), function () {
       var ad = get(ADD); ad[self] = { t: Date.now() }; put(ADD, ad);
       var dv = get(DISC); if (dv[self]) { dv[self].ack = false; put(DISC, dv); }
-      else if (queueSelf(self) && !discBusy) runDisc();
+      else if (queueSelf(self)) runDisc();
       cardKey = ''; seriesCard();
     }, true));
     return;
@@ -1867,13 +1908,13 @@ function openPage() {
     var self = (location.origin + path).replace(/\/$/, '');
     if (!get(DISC)[self]) queueSelf(self);
   }
-  clearTimeout(discT); discT = setTimeout(discover, 2500);
+  clearTimeout(discT); discT = setTimeout(discover, 1200);
 }
 
 window.addEventListener('scroll', function () {
   trackAct(); tickRead();
   onScroll();
-  if (!isChapter()) { clearTimeout(discT); discT = setTimeout(discover, 2000); }
+  if (!isChapter()) { clearTimeout(discT); discT = setTimeout(discover, 1000); }
 }, { passive: true });
 window.addEventListener('pagehide', function () { save(true); });
 document.addEventListener('visibilitychange', function () { if (document.hidden) save(true); });
