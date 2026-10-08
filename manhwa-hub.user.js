@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.41.0
+// @version      3.42.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.41.0';
+var VERSION = '3.42.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -41,6 +41,8 @@ var UNIT = [[/^(s|sec|secs|second|seconds|sek|sekunde|sekunden)$/, 1e3], [/^(m|m
 var MORE_RE = /^(?:\.\.\.|…)?\s*(?:(?:read|show|see|view)\s+(?:more|less|all|full)|mehr(?:\s+anzeigen)?|weniger(?:\s+anzeigen)?|expand|collapse|\+\s*more)\s*(?:»|›|>|▼|▲)?$/i;
 var STATUS_WORDS = [[/\b(completed?|finished|ended|abgeschlossen|beendet)\b/i, 'done'], [/\b(hiatus|on.?hold|paused|pausiert|season end)\b/i, 'hiatus'],
   [/\b(dropped|cancell?ed|discontinued|abgebrochen|eingestellt)\b/i, 'dropped'], [/\b(ongoing|on.?going|publishing|releasing|laufend)\b/i, 'ongoing']];
+// Beschriftung alternativer Namen („Alternative:“, „Associated Names“ …), Gruppe 1 = Doppelpunkt
+var ALT_LABEL = /^(?:alternative(?:\s+(?:titles?|names?))?|alt(?:\.|ernative)?\s*names?|associated\s+names?|other\s+names?|also\s+known\s+as|aka|synonyms?|alternativ(?:e)?\s*(?:titel|namen)?)\b\s*(:)?\s*/i;
 function cutEnd(t) { return /(\.\.\.|…)\s*$/.test(t); }
 function hostOf(u) { try { return new URL(u).hostname; } catch (e) { return ''; } }
 // Datensparmodus aus den Lese-Einstellungen (ohne prefs() aus 04-pc, das im Hub-Teil nicht läuft)
@@ -95,7 +97,7 @@ function token(forClipboard) {
   var c = Object.keys(cv).filter(function (k) { return !cv[k].ack && (!forClipboard || (cv[k].sent || 0) < 2); })
     .map(function (k) { return { url: k, img: cv[k].img, title: cv[k].title, q: cv[k].q || 0 }; });
   var dd = get(DISC), d = Object.keys(dd).filter(function (k) { return !dd[k].ack; }).slice(0, forClipboard ? 30 : 150)
-    .map(function (k) { var e = dd[k]; return { url: k, title: e.title, rating: e.rating, ch: e.ch, chUrl: e.chUrl, img: e.img, site: e.site, g: e.g, desc: e.desc, type: e.type, rel: e.rel, ss: e.ss || '', q: e.q || 0, feat: e.feat || 0 }; });
+    .map(function (k) { var e = dd[k]; return { url: k, title: e.title, rating: e.rating, ch: e.ch, chUrl: e.chUrl, img: e.img, site: e.site, g: e.g, desc: e.desc, type: e.type, rel: e.rel, ss: e.ss || '', q: e.q || 0, feat: e.feat || 0, alt: e.alt || [] }; });
   var a = forClipboard ? [] : Object.keys(get(ADD));
   var rr = get('mhub_rate'), r = Object.keys(rr).map(function (k) { return { k: k, r: rr[k].r, t: rr[k].t }; });
   if (!p.length && !c.length && !d.length && !a.length && !r.length) return '';
@@ -1449,6 +1451,7 @@ function fromDoc(c, doc, cb) {
     else if (!e.type) e.type = badgeType(doc.body);
     if (!e.type && /\/novels?\//i.test(c.url)) e.type = 'Novel';
     e.ss = siteStatus(doc);
+    e.alt = altNames(doc);
   }
   // 400 px breit: scharf in der Entdecken-Liste auch bei hoher Pixeldichte; hervorgehobene (fürs Karussell) 600 px.
   // Quelle in passender Größe (docCoverUrl), sonst das Bild der Karte
@@ -1525,14 +1528,15 @@ function refreshRel() {
   if (mx == null) return;
   var all = get(DISC), e = all[self]; if (!e) return; // Erster Besuch: der Eintrag entsteht gerade beim Entdecken
   var list = Object.keys(rel).map(function (n) { return [parseFloat(n), rel[n]]; }).sort(function (a, b) { return a[0] - b[0]; }).slice(-20);
-  var desc = fullDesc(document), hg = headGenres(document), ss = siteStatus(document);
-  var sig = JSON.stringify([list, mx, desc.length, hg, ss]);
+  var desc = fullDesc(document), hg = headGenres(document), ss = siteStatus(document), alt = altNames(document);
+  var sig = JSON.stringify([list, mx, desc.length, hg, ss, alt]);
   relDoneFor = path;
   if (e.relSig === sig) return;
   if (list.length) e.rel = list;
   if (desc && desc.length >= (e.desc || '').length) e.desc = desc;
   if (hg.length) e.g = mergeGenres(hg, e.g || []);
   if (ss) e.ss = ss;
+  if (alt.length) e.alt = alt;
   if (mx > (e.ch || 0)) { e.ch = mx; e.chUrl = mxU; }
   e.relSig = sig; e.ack = false; e.t = Date.now();
   put(DISC, keep(all, DISC_KEEP));
@@ -1746,6 +1750,43 @@ function fullDesc(root) {
     if (c && v > sc) { txt = c; sc = v; }
   });
   return txt.slice(0, 5000);
+}
+/* Alternative Namen der Serie: Asura zeigt sie unter dem Titel, getrennt mit „•“; andere Seiten unter einer Beschriftung
+   wie „Alternative“, „Associated Names“, „Other names“ oder in einem Element mit „alternative“ in der Klasse. */
+function altNames(root) {
+  var h1 = root.querySelector('h1'), title = h1 ? normT(h1.textContent) : '', raw = [], comma = false;
+  // 1. Beschriftung „Alternative: …“ (Wert im selben Element oder im nächsten)
+  root.querySelectorAll('h1,h2,h3,h4,h5,h6,span,div,b,strong,dt,th,td,p,label,li').forEach(function (el) {
+    if (raw.length || el.childElementCount > 3) return;
+    if ((el.textContent || '').length > 700) return;
+    var t = spacedText(el), m = t.match(ALT_LABEL); if (!m) return;
+    // Nur eine echte Beschriftung: mit Doppelpunkt, allein im Element, oder als eigenes erstes Kind-Element
+    var first = el.firstElementChild && (el.firstElementChild.textContent || '').replace(/\s+/g, ' ').trim();
+    if (!m[1] && t !== m[0].trim() && !(first && ALT_LABEL.test(first) && first.replace(ALT_LABEL, '') === '')) return;
+    var v = t.slice(m[0].length).trim();
+    if (!v && el.nextElementSibling) v = (el.nextElementSibling.innerText || el.nextElementSibling.textContent || '').trim();
+    if (v && v.length < 700) { raw.push(v); comma = true; }
+  });
+  // 2. Element mit „alternative“/„alt-name“ in der Klasse
+  if (!raw.length) { var c = root.querySelector('[class*="alternative"],[class*="alt-name"],[class*="altname"],[class*="alt_title"]'); if (c && (c.textContent || '').length < 700) raw.push((c.textContent || '').replace(ALT_LABEL, '')); }
+  // 3. Zeile direkt unter dem Titel mit mehreren durch • getrennten Namen (Asura)
+  // Nur, wenn es nach Namen aussieht: jeder Teil kurz und nicht kleingeschrieben (kein Fließtext mit •)
+  var looksList = function (t) { var ps = t.split(/\s*[•·]\s*/); return ps.length >= 2 && ps.every(function (x) { return x && x.length <= 120 && !/^[a-z]/.test(x); }); };
+  if (!raw.length && h1) {
+    for (var el = h1.nextElementSibling, i = 0; el && i < 3 && !raw.length; el = el.nextElementSibling, i++) {
+      var t3 = (el.textContent || '').trim(); if (t3.length < 700 && /\s[•·]\s/.test(t3) && looksList(t3)) raw.push(t3);
+    }
+    if (!raw.length && h1.parentElement) [].forEach.call(h1.parentElement.children, function (el) { var t4 = (el.textContent || '').trim(); if (!raw.length && el !== h1 && t4.length < 700 && /\s[•·]\s/.test(t4) && looksList(t4)) raw.push(t4); });
+  }
+  var out = [], seen = {};
+  // Getrennt mit • ; | / oder Zeilen; bei einer Beschriftung ohne diese Zeichen auch mit Komma („A, B, C“)
+  var all = raw.join('\n'), sep = comma && !/[•·;|\n]|\s\/\s/.test(all) ? /\s*,\s+/ : /\s*[•·;|\n]\s*|\s+\/\s+/;
+  all.split(sep).forEach(function (x) {
+    x = x.replace(/\s+/g, ' ').trim(); var k = normT(x);
+    if (x.length < 2 || x.length > 150 || !k || k === title || seen[k]) return;
+    seen[k] = 1; out.push(x);
+  });
+  return out.slice(0, 12);
 }
 // Genres unter einer Überschrift „Genres“/„Tags“, z. B. als Knöpfe (Asura)
 function headGenres(root) {
