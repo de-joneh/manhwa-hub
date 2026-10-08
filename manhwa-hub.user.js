@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.33.0
+// @version      3.34.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.33.0';
+var VERSION = '3.34.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -178,8 +178,8 @@ if (isHub || topMode) {
   };
   // Ältere, kleine Cover neu holen (MHUB-COVERS: [{id, page}]): og:image der Serienseite, größte srcset-Variante dazu
   var absFull = function (h, base) { try { return new URL(h, base).href; } catch (e) { return ''; } };
-  var coverOfPage = function (html, page) {
-    var doc = new DOMParser().parseFromString(html, 'text/html'), og = doc.querySelector('meta[property="og:image"],meta[name="twitter:image"]');
+  var coverOfPage = function (doc, page) {
+    var og = doc.querySelector('meta[property="og:image"],meta[name="twitter:image"]');
     var ogU = og && og.content ? absFull(og.content, page) : ''; if (!ogU) return '';
     var fileOf = function (u) { return u.split(/[?#]/)[0].split('/').pop(); }, base = fileOf(ogU), best = ogU, bw = 0;
     [].forEach.call(doc.querySelectorAll('img[srcset],source[srcset]'), function (im) {
@@ -199,10 +199,25 @@ if (isHub || topMode) {
       if (i >= jobs.length) return;
       var j = jobs[i++];
       fetchText(j.page, function (html) {
-        var u = html ? coverOfPage(html, j.page) : '';
-        var done = function (img) { post('MHUB-COVEROK:' + JSON.stringify({ id: j.id, img: img || '', q: COVER_Q })); setTimeout(next, 1200); };
+        var doc = null; try { doc = html ? new DOMParser().parseFromString(html, 'text/html') : null; } catch (e) {}
+        var u = doc ? coverOfPage(doc, j.page) : '', desc = doc ? fullDesc(doc) : '';
+        var done = function (img) { post('MHUB-COVEROK:' + JSON.stringify({ id: j.id, img: img || '', q: COVER_Q, desc: desc })); setTimeout(next, 1200); };
         if (!u) return done('');
         shrink(u, done, j.w);
+      });
+    })();
+  };
+  // Gekürzte Beschreibungen neu holen (MHUB-DESC: [{id, page}]), ab Skript 3.34
+  var runDescs = function (jobs) {
+    if (!Array.isArray(jobs)) return;
+    var i = 0;
+    (function next() {
+      if (i >= jobs.length) return;
+      var j = jobs[i++];
+      fetchText(j.page, function (html) {
+        var desc = ''; try { if (html) desc = fullDesc(new DOMParser().parseFromString(html, 'text/html')); } catch (e) {}
+        post('MHUB-DESCOK:' + JSON.stringify({ id: j.id, desc: desc }));
+        setTimeout(next, 1200);
       });
     })();
   };
@@ -249,6 +264,7 @@ if (isHub || topMode) {
     }
     else if (d.indexOf('MHUB-CHECK:') === 0) { try { runCheck(JSON.parse(d.slice(11))); } catch (err) {} }
     else if (d.indexOf('MHUB-COVERS:') === 0) { try { runCovers(JSON.parse(d.slice(12))); } catch (err) {} }
+    else if (d.indexOf('MHUB-DESC:') === 0) { try { runDescs(JSON.parse(d.slice(10))); } catch (err) {} }
     else if (d.indexOf('MHUB-FIND:') === 0) { try { runFind(JSON.parse(d.slice(10))); } catch (err) {} }
     else if (d.indexOf('MHUB-IMG:') === 0) {
       try { var o = JSON.parse(d.slice(9)); shrink(o.url, function (img) { post('MHUB-IMGOK:' + JSON.stringify({ id: o.id, img: img })); }); } catch (err) {}
@@ -1458,46 +1474,133 @@ function discover() {
 }
 
 /* ---------- Beschreibung und Genres von der Serienseite ---------- */
-// Text mit Absätzen: Blöcke und <br> werden zu Zeilenumbrüchen
+// Text mit Absätzen: Blöcke und <br> werden zu Zeilenumbrüchen. „Mehr anzeigen“-Knöpfe und -Links gehören nicht dazu
+var MORE_RE = /^(?:\.\.\.|…)?\s*(?:(?:read|show|see|view)\s+(?:more|less|all|full)|mehr(?:\s+anzeigen)?|weniger(?:\s+anzeigen)?|expand|collapse|\+\s*more)\s*(?:»|›|>|▼|▲)?$/i;
 function blockText(el) {
   var out = '';
   (function walk(n) {
     if (n.nodeType === 3) { out += n.nodeValue; return; }
-    if (n.nodeType !== 1 || /^(SCRIPT|STYLE|NOSCRIPT|BUTTON|SVG)$/i.test(n.tagName)) return;
+    if (n.nodeType !== 1 || /^(SCRIPT|STYLE|NOSCRIPT|BUTTON|SVG|TEMPLATE)$/i.test(n.tagName)) return;
     if (n.tagName === 'BR') { out += '\n'; return; }
+    if (/^(A|SPAN|LABEL)$/.test(n.tagName) && MORE_RE.test((n.textContent || '').trim())) return;
     var blk = /^(P|DIV|LI|H[1-6]|SECTION|ARTICLE|BLOCKQUOTE)$/.test(n.tagName);
     if (blk) out += '\n';
     for (var c = n.firstChild; c; c = c.nextSibling) walk(c);
     if (blk) out += '\n';
   })(el);
-  return out.replace(/[ \t ]+/g, ' ').replace(/ *\n */g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+  return out.replace(/[ \t ]+/g, ' ').replace(/ *\n */g, '\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 function normT(t) { return String(t || '').replace(/\s+/g, ' ').trim().toLowerCase(); }
+var cutEnd = function (t) { return /(\.\.\.|…)\s*$/.test(t); };
+// Text, der als HTML kommt (<p>…</p> in JSON): in Absätze umwandeln
+function htmlText(t) {
+  if (!/<[a-z\/][^>]*>|&[a-z#0-9]+;/i.test(t)) return t;
+  try { var d = new DOMParser().parseFromString('<div>' + t + '</div>', 'text/html'); return blockText(d.body); } catch (e) { return t; }
+}
+// Längste Kurzbeschreibung aus den Metadaten (og:, twitter:, description)
+function metaDesc(root) {
+  var best = '';
+  [].forEach.call(root.querySelectorAll('meta[property="og:description"],meta[name="twitter:description"],meta[name="description"],meta[itemprop="description"]'), function (m) {
+    var t = (m.content || '').replace(/\s+/g, ' ').trim(); if (t.length > best.length) best = t;
+  });
+  return best;
+}
+// Strukturierte Daten (JSON-LD): oft die volle Beschreibung
+function ldDescs(root) {
+  var out = [];
+  [].forEach.call(root.querySelectorAll('script[type="application/ld+json"]'), function (sc) {
+    try {
+      (function walk(o, depth) {
+        if (!o || typeof o !== 'object' || depth > 6) return;
+        if (typeof o.description === 'string') out.push(o.description);
+        Object.keys(o).forEach(function (k) { if (o[k] && typeof o[k] === 'object') walk(o[k], depth + 1); });
+      })(JSON.parse(sc.textContent || ''), 0);
+    } catch (e) {}
+  });
+  return out;
+}
+// Volle Beschreibung in den Daten der Seite (Next.js, Nuxt …): eine Zeichenkette in einem Skript, die wie der Anfang der
+// Kurzbeschreibung beginnt. Auch doppelt verpackt (JSON in einer JS-Zeichenkette, z. B. self.__next_f.push).
+function scriptDescs(root, meta) {
+  var out = [], key = '';
+  // Suchschlüssel: ein Stück vom Anfang ohne Satzzeichen, die in JSON anders aussehen könnten
+  (meta.slice(0, 120).match(/[A-Za-z0-9 ,]{16,}/g) || []).forEach(function (m) { if (!key && m.trim().length >= 16) key = m.trim().slice(0, 40); });
+  if (!key) return out;
+  var quoteAt = function (t, i) { var b = 0; while (i - 1 - b >= 0 && t.charAt(i - 1 - b) === '\\') b++; return b; };
+  [].forEach.call(root.querySelectorAll('script:not([src])'), function (sc) {
+    var t = sc.textContent || '', at = 0, n = 0;
+    if (t.length > 4000000 || /ld\+json/.test(sc.type || '')) return;
+    while ((at = t.indexOf(key, at)) > -1 && n++ < 20) {
+      // Anfang der Zeichenkette: ein " davor (einfach) oder \" (doppelt verpackt); ein paar Möglichkeiten durchprobieren
+      for (var a = at - 1, tries = 0; a >= 0 && at - a < 600 && tries < 4; a--) {
+        if (t.charAt(a) !== '"') continue;
+        var lvl = quoteAt(t, a); if (lvl > 1) continue;
+        tries++;
+        var e = at + key.length, ok = false;
+        while (e < t.length && e - at < 16000) { if (t.charAt(e) === '"' && quoteAt(t, e) === lvl) { ok = true; break; } e++; }
+        if (!ok) continue;
+        try {
+          var v = JSON.parse('"' + t.slice(a + 1, e - lvl) + '"');
+          if (lvl) v = JSON.parse('"' + v + '"');
+          // Kein Stück JSON (falsch erkannte Grenzen), und der Anfang muss vorne stehen
+          if (!/"\s*:\s*["{\[]|\\"|^\s*[{\[]/.test(v) && normT(v).indexOf(normT(key)) < 80) out.push(v);
+        } catch (err) {}
+      }
+      at += key.length;
+    }
+  });
+  return out;
+}
 // Die Kurzbeschreibung in den Metadaten ist oft abgeschnitten. Gesucht wird das Element, das ihren Anfang enthält,
-// dann nach oben, solange der Behälter nur Absätze enthält (mehrere <p> einer Beschreibung).
+// dann nach oben, solange der Behälter nur Absätze enthält (mehrere <p> einer Beschreibung). Dazu volle Fassungen aus
+// JSON-LD und den Seitendaten; genommen wird die längste, die zum Anfang passt.
 function fullDesc(root) {
-  var md = root.querySelector('meta[property="og:description"],meta[name="description"]');
-  var meta = md && md.content ? md.content.replace(/\s+/g, ' ').trim() : '';
-  var probe = normT(meta.replace(/(\.\.\.|…)\s*$/, '')).slice(0, 60), best = null, bl = 1e9;
+  var meta = metaDesc(root);
+  var probe = normT(meta.replace(/(\.\.\.|…)\s*$/, '')).slice(0, 60), best = null, bl = 1e9, bestCut = true;
   if (probe.length >= 20) {
     root.querySelectorAll('p,div,span,section,article').forEach(function (el) {
-      if (el.closest('head,script,style,noscript')) return;
-      var t = normT(el.textContent); if (t.length < probe.length || t.length > 8000) return;
-      if (t.indexOf(probe) > -1 && t.length < bl) { best = el; bl = t.length; }
+      if (el.closest('head,script,style,noscript,template')) return;
+      var t = normT(el.textContent); if (t.length < probe.length || t.length > 8000 || t.indexOf(probe) < 0) return;
+      // Lieber ein Element mit dem ganzen Text als eine gekürzte Vorschau („… Mehr anzeigen“)
+      var c = cutEnd(normT(blockText(el)));
+      if ((bestCut && !c) || (c === bestCut && t.length < bl)) { best = el; bl = t.length; bestCut = c; }
     });
-    while (best && best.parentElement && best.parentElement !== root.body && normT(best.parentElement.textContent).length < 8000 &&
-      [].every.call(best.parentElement.children, function (c) { return /^(P|SPAN|BR|EM|STRONG|I|B|U)$/.test(c.tagName); })) best = best.parentElement;
+    var okChild = function (c) {
+      if (/^(P|SPAN|BR|EM|STRONG|I|B|U|SMALL|BUTTON)$/.test(c.tagName)) return true;
+      if (/^(A|LABEL)$/.test(c.tagName)) return MORE_RE.test((c.textContent || '').trim());
+      return c.tagName === 'DIV' && !c.querySelector('div,section,article,h1,h2,h3,h4,h5,h6,ul,ol,table,img');
+    };
+    while (best && best.parentElement && best.parentElement !== root.body) {
+      var par = best.parentElement, pt = normT(par.textContent);
+      // Steht der Anfang zweimal drin (Vorschau und volle Fassung), nicht zusammenlegen
+      if (pt.length >= 8000 || pt.indexOf(probe) !== pt.lastIndexOf(probe) || ![].every.call(par.children, okChild)) break;
+      best = par;
+    }
   }
   if (!best) {
     // Ohne Metadaten: Text unter einer Überschrift wie „Synopsis“
-    root.querySelectorAll('h1,h2,h3,h4,h5,h6,span,div,b,strong').forEach(function (h) {
+    root.querySelectorAll('h1,h2,h3,h4,h5,h6,span,div,b,strong,dt').forEach(function (h) {
       if (best || h.children.length) return;
-      if (!/^(synopsis|summary|description|story|beschreibung|inhalt|zusammenfassung)\s*:?$/i.test((h.textContent || '').trim())) return;
-      var nx = h.nextElementSibling; if (nx && normT(nx.textContent).length > 40) best = nx;
+      if (!/^(synopsis|summary|description|story|plot|beschreibung|inhalt|zusammenfassung)\s*:?$/i.test((h.textContent || '').trim())) return;
+      var nx = h.nextElementSibling || (h.parentElement && h.parentElement.nextElementSibling);
+      if (nx && normT(nx.textContent).length > 40) best = nx;
     });
   }
-  var txt = best ? blockText(best) : '';
-  if (!txt || txt.length < meta.replace(/(\.\.\.|…)$/, '').length - 3) txt = meta;
+  var cands = [best ? blockText(best) : ''];
+  var start = normT(meta).slice(0, 30);
+  ldDescs(root).concat(meta ? scriptDescs(root, meta) : []).forEach(function (v) {
+    v = htmlText(String(v)).replace(/\r\n?/g, '\n').replace(/[ \t ]+/g, ' ').replace(/ *\n */g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+    // Nur Fassungen, die wie die Kurzbeschreibung anfangen (ohne Metadaten: JSON-LD)
+    if (v.length <= 8000 && (start.length < 20 ? true : normT(v).indexOf(start) > -1 && normT(v).indexOf(start) < 80)) cands.push(v);
+  });
+  cands.push(meta);
+  // Längste gewinnt; gekürzte („…“) zählen etwas weniger
+  var txt = '', sc = -1;
+  cands.forEach(function (c) {
+    c = String(c || '').replace(/\s*(?:\.\.\.|…)?\s*(?:read|show|see|view)\s+(?:more|less|all)\s*$/i, '').trim();
+    var v = c.length - (cutEnd(c) ? 25 : 0);
+    if (c && v > sc) { txt = c; sc = v; }
+  });
   return txt.slice(0, 5000);
 }
 // Genres unter einer Überschrift „Genres“/„Tags“, z. B. als Knöpfe (Asura)
