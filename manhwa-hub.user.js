@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.29.0
+// @version      3.30.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,11 +23,13 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.29.0';
+var VERSION = '3.30.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
 var SERIES = /\/(?:series|manga|manhwa|manhua|comics?|title|webtoon|novels?)\/[^\/]+\/?$/;
+// Cover: Zielgröße und Qualitätsstufe (ältere Stufen werden einmal neu geholt). Hier oben, weil auch der Hub-Teil sie braucht
+var COVER_W = 600, COVER_H = 800, COVER_Q = 2;
 var LOG = 'mhub_log', COV = 'mhub_cov', DISC = 'mhub_disc', LIB = 'mhub_lib', ADD = 'mhub_add';
 
 function get(k) { try { return JSON.parse(GM_getValue(k, '{}')) || {}; } catch (e) { return {}; } }
@@ -47,12 +49,13 @@ function token(forClipboard) {
   var l = get(LOG), cv = get(COV);
   var p = Object.keys(l).map(function (k) { return { url: k, pct: l[k].pct, t: l[k].t, site: l[k].site || 0, d: l[k].d || 0 }; });
   var c = Object.keys(cv).filter(function (k) { return !cv[k].ack && (!forClipboard || (cv[k].sent || 0) < 2); })
-    .map(function (k) { return { url: k, img: cv[k].img, title: cv[k].title }; });
+    .map(function (k) { return { url: k, img: cv[k].img, title: cv[k].title, q: cv[k].q || 0 }; });
   var dd = get(DISC), d = Object.keys(dd).filter(function (k) { return !dd[k].ack; }).slice(0, forClipboard ? 30 : 150)
-    .map(function (k) { var e = dd[k]; return { url: k, title: e.title, rating: e.rating, ch: e.ch, chUrl: e.chUrl, img: e.img, site: e.site, g: e.g, desc: e.desc, type: e.type, rel: e.rel }; });
+    .map(function (k) { var e = dd[k]; return { url: k, title: e.title, rating: e.rating, ch: e.ch, chUrl: e.chUrl, img: e.img, site: e.site, g: e.g, desc: e.desc, type: e.type, rel: e.rel, ss: e.ss || '' }; });
   var a = forClipboard ? [] : Object.keys(get(ADD));
-  if (!p.length && !c.length && !d.length && !a.length) return '';
-  return 'MHUB2:' + btoa(unescape(encodeURIComponent(JSON.stringify({ p: p, c: c, d: d, a: a }))));
+  var rr = get('mhub_rate'), r = Object.keys(rr).map(function (k) { return { k: k, r: rr[k].r, t: rr[k].t }; });
+  if (!p.length && !c.length && !d.length && !a.length && !r.length) return '';
+  return 'MHUB2:' + btoa(unescape(encodeURIComponent(JSON.stringify({ p: p, c: c, d: d, a: a, r: r }))));
 }
 
 /* ---------- Im Hub ---------- */
@@ -173,6 +176,36 @@ if (isHub || topMode) {
       });
     })();
   };
+  // Ältere, kleine Cover neu holen (MHUB-COVERS: [{id, page}]): og:image der Serienseite, größte srcset-Variante dazu
+  var absFull = function (h, base) { try { return new URL(h, base).href; } catch (e) { return ''; } };
+  var coverOfPage = function (html, page) {
+    var doc = new DOMParser().parseFromString(html, 'text/html'), og = doc.querySelector('meta[property="og:image"],meta[name="twitter:image"]');
+    var ogU = og && og.content ? absFull(og.content, page) : ''; if (!ogU) return '';
+    var fileOf = function (u) { return u.split(/[?#]/)[0].split('/').pop(); }, base = fileOf(ogU), best = ogU, bw = 0;
+    [].forEach.call(doc.querySelectorAll('img[srcset],source[srcset]'), function (im) {
+      String(im.getAttribute('srcset')).split(',').forEach(function (part) {
+        var m = part.trim().match(/^(\S+)\s+(\d+)w$/); if (!m) return;
+        var u = absFull(m[1], page), q = ''; try { q = new URL(m[1], page).searchParams.get('url') || ''; } catch (e) {}
+        if (q) u = absFull(q, page);
+        if (fileOf(u) === base && +m[2] > bw) { bw = +m[2]; best = u; }
+      });
+    });
+    return best;
+  };
+  var runCovers = function (jobs) {
+    if (!Array.isArray(jobs)) return;
+    var i = 0;
+    (function next() {
+      if (i >= jobs.length) return;
+      var j = jobs[i++];
+      fetchText(j.page, function (html) {
+        var u = html ? coverOfPage(html, j.page) : '';
+        var done = function (img) { post('MHUB-COVEROK:' + JSON.stringify({ id: j.id, img: img || '', q: COVER_Q })); setTimeout(next, 1200); };
+        if (!u) return done('');
+        shrink(u, done);
+      });
+    })();
+  };
   var runFind = function (o) {
     if (!o || !Array.isArray(o.sites) || !Array.isArray(o.titles) || !o.titles.length) return;
     var i = 0, found = 0;
@@ -213,9 +246,10 @@ if (isHub || topMode) {
       } catch (err) {}
     }
     else if (d.indexOf('MHUB-CHECK:') === 0) { try { runCheck(JSON.parse(d.slice(11))); } catch (err) {} }
+    else if (d.indexOf('MHUB-COVERS:') === 0) { try { runCovers(JSON.parse(d.slice(12))); } catch (err) {} }
     else if (d.indexOf('MHUB-FIND:') === 0) { try { runFind(JSON.parse(d.slice(10))); } catch (err) {} }
     else if (d.indexOf('MHUB-IMG:') === 0) {
-      try { var o = JSON.parse(d.slice(9)); shrink(o.url, 360, 480, function (img) { post('MHUB-IMGOK:' + JSON.stringify({ id: o.id, img: img })); }); } catch (err) {}
+      try { var o = JSON.parse(d.slice(9)); shrink(o.url, function (img) { post('MHUB-IMGOK:' + JSON.stringify({ id: o.id, img: img })); }); } catch (err) {}
     }
   });
   if (GM_addValueChangeListener) {
@@ -223,6 +257,7 @@ if (isHub || topMode) {
     GM_addValueChangeListener(COV, function (n, o, v, remote) { if (remote) send(); });
     GM_addValueChangeListener(DISC, function (n, o, v, remote) { if (remote) send(); });
     GM_addValueChangeListener(ADD, function (n, o, v, remote) { if (remote) send(); });
+    GM_addValueChangeListener('mhub_rate', function (n, o, v, remote) { if (remote) send(); });
   }
   if (isHub) { post('MHUB-CORE:' + VERSION); send(); }
   else {
@@ -296,7 +331,7 @@ function toggleMode() {
     GM_setValue('mhub_switch', JSON.stringify({ to: toOrig ? 'orig' : 'clean', t: Date.now() }));
     location.reload(); return;
   }
-  asStop(true); dropPeek(); fadeCover(true);
+  asStop(true); dropPeek(); dropNext(); fadeCover(true);
   var finish = function () {
     resetBox(); findBox();
     var end = function () { fadeCover(false); switching = false; onScroll(); };
@@ -309,11 +344,18 @@ function toggleMode() {
   else prepareReader(function () { finish(); setTimeout(prefetchNeighbors, 300); });
 }
 cleanBtn.addEventListener('click', toggleMode);
-dock.appendChild(pill); dock.appendChild(cleanBtn); dock.appendChild(homeBtn);
+// Vorrat für unterwegs: nur im Modus „Nur Bilder“
+var stockBtn = document.createElement('div');
+stockBtn.setAttribute('role', 'button'); stockBtn.setAttribute('aria-label', L('Nächste Kapitel für unterwegs laden', 'Load next chapters for offline'));
+stockBtn.textContent = '⬇';
+stockBtn.style.cssText = 'display:none;background:#17121f;color:#fff;padding:9px 12px;border-radius:999px;box-shadow:0 3px 12px rgba(0,0,0,.45);cursor:pointer;border:1px solid #3a3350;font-size:13px';
+stockBtn.addEventListener('click', function () { stockUp(); });
+dock.appendChild(pill); dock.appendChild(stockBtn); dock.appendChild(cleanBtn); dock.appendChild(homeBtn);
 // In Kapiteln ist die Leiste versteckt. Ein Tipp blendet sie ein und aus, ein Doppeltipp wechselt zwischen Original und „Nur Bilder“.
 var dockT = 0;
 function showDock(ms, force) {
   if (!force && Date.now() < quietUntil) return;
+  stockBtn.style.display = reader && isChapter() ? 'block' : 'none';
   dock.style.opacity = '1'; dock.style.pointerEvents = 'auto';
   clearTimeout(dockT);
   if (isChapter()) dockT = setTimeout(hideDock, ms || 3000);
@@ -406,13 +448,13 @@ function buildReader() {
   if (addReaderImgs(srcImgs) < 3) { reader = null; return 'skip'; }
   readerStyle = document.createElement('style');
   readerStyle.textContent = 'html,body{background:#000!important;overflow-x:hidden!important;overflow-y:auto!important;margin:0!important}' +
-    'body>*:not(#mhub-reader):not(#mhub-dock):not(#mhub-nav):not(#mhub-peek):not(#mhub-fade){display:none!important}' +
-    '#mhub-nav{display:flex!important;gap:8px;max-width:var(--mhub-w,820px);margin:0 auto;padding:18px 12px 120px;background:#000;font:700 15px system-ui,sans-serif}' +
+    'body>*:not(#mhub-reader):not(#mhub-dock):not(#mhub-nav):not(#mhub-peek):not(#mhub-fade):not(#mhub-next){display:none!important}' +
+    '#mhub-nav{display:flex!important;flex-wrap:wrap;gap:8px;max-width:var(--mhub-w,820px);margin:0 auto;padding:18px 12px 120px;background:#000;font:700 15px system-ui,sans-serif}' +
     '#mhub-nav a{flex:1;display:flex;align-items:center;justify-content:center;min-height:52px;border-radius:12px;background:#2a2639;color:#ece9f6;text-decoration:none;text-align:center;padding:0 10px}' +
     '#mhub-nav a.nx{background:#913fe2;color:#fff;flex:1.4}#mhub-nav span{flex:1.4;display:flex;align-items:center;justify-content:center;color:#9893b0}' +
     // pan-y: der Browser scrollt senkrecht selbst und muss nie auf das Skript warten; waagerecht gehört dem Wischen
     '#mhub-reader{display:block!important;background:#000;padding:0;margin:0;touch-action:pan-y pinch-zoom}' +
-    '#mhub-reader img{display:block;width:100%;max-width:var(--mhub-w,820px);height:auto;margin:0 auto;border:0}';
+    '#mhub-reader img,#mhub-next img{display:block;width:100%;max-width:var(--mhub-w,820px);height:auto;margin:0 auto;border:0}#mhub-next{display:block!important;background:#000}';
   applyWidth();
   (document.head || document.documentElement).appendChild(readerStyle);
   document.body.appendChild(reader);
@@ -437,6 +479,7 @@ function buildReader() {
   return true;
 }
 function teardownReader() {
+  dropNext();
   if (readerObs) { readerObs.disconnect(); readerObs = null; }
   if (reader && reader.parentNode) reader.parentNode.removeChild(reader);
   if (readerStyle && readerStyle.parentNode) readerStyle.parentNode.removeChild(readerStyle);
@@ -445,23 +488,24 @@ function teardownReader() {
 }
 var CHPART = /((?:chapter|chap|ch|episode|ep)[-_\/ .]?)(\d+(?:[-_.]\d+)?)/i;
 // Vorheriges/nächstes Kapitel und Serienseite. Links stammen von der Seite; fehlt einer, wird er gebaut, wenn der Hub das Kapitel kennt
-function chapterTargets() {
-  var root = curDoc || document;
-  var m = path.match(CHPART); if (!m) return null;
-  var n = parseFloat(m[2].replace(/[-_]/, '.')), head = path.slice(0, m.index), strip = function (p) { return p.toLowerCase().replace(CHPART, '#'); };
-  var found = {}, me = strip(path);
+// root/pth: für ein anderes, schon geholtes Kapitel (Vorrat); sonst das offene
+function chapterTargets(root, pth) {
+  root = root || curDoc || document; pth = pth || path;
+  var m = pth.match(CHPART); if (!m) return null;
+  var n = parseFloat(m[2].replace(/[-_]/, '.')), head = pth.slice(0, m.index), strip = function (p) { return p.toLowerCase().replace(CHPART, '#'); };
+  var found = {}, me = strip(pth);
   root.querySelectorAll('a[href]').forEach(function (a) {
     var u = absUrl(a.getAttribute('href')), k = chOf(u);
     if (k == null || strip(pathOf(u)) !== me || new URL(u).hostname !== location.hostname) return;
     if (!found[k]) found[k] = u;
   });
   var key = slugBase(head.replace(/[-_\/]+$/, '')).replace(/[^a-z0-9]/g, ''), e = key ? libEntry(key) : null;
-  var make = function (k) { return location.origin + path.replace(CHPART, function (all, a) { return a + k; }); };
+  var make = function (k) { return location.origin + pth.replace(CHPART, function (all, a) { return a + k; }); };
   var prevN = Math.ceil(n) - 1, nextN = Math.floor(n) + 1;
   var prev = found[prevN] || (prevN >= 1 ? make(prevN) : '');
   var next = found[nextN] || (e && e.m >= nextN ? make(nextN) : '');
   var home = head.replace(/[-_\/]+$/, ''), homeUrl = isSeriesUrl(location.origin + home) ? location.origin + home : '';
-  return { prev: prev, prevN: prevN, next: next, nextN: nextN, homeUrl: homeUrl };
+  return { prev: prev, prevN: prevN, next: next, nextN: nextN, homeUrl: homeUrl, n: n, key: key, lib: e };
 }
 // Beim Verlassen die echte Stelle speichern, damit man beim Zurückkommen dort landet. Fast am Ende zählt als fertig
 function leaveChapter() {
@@ -483,6 +527,7 @@ function chapterNav() {
     else a.addEventListener('click', function () { save(true); });
     nav.appendChild(a);
   };
+  var card = endCard(t); if (card) nav.appendChild(card);
   if (prev) link(prev, '‹ ' + prevN);
   if (homeUrl) link(homeUrl, L('Serie', 'Series'));
   if (next) link(next, L('Kapitel ', 'Chapter ') + nextN + ' ›', 'nx');
@@ -490,6 +535,42 @@ function chapterNav() {
   // Klicks nicht an die Seite weitergeben (Werbe-Fenster)
   nav.addEventListener('click', function (ev) { ev.stopPropagation(); });
   return nav;
+}
+// Karte am Kapitelende: wie viel noch offen ist; aufgeholt: nächster Termin, Wertung (falls noch keine), nächste Serie der Warteschlange
+var RATE = 'mhub_rate';
+function endCard(t) {
+  var e = t.lib; if (!e) return null;
+  var left = e.m ? Math.max(0, Math.floor(e.m) - Math.floor(t.n)) : 0;
+  var card = document.createElement('div'); card.id = 'mhub-end';
+  card.style.cssText = 'flex:1 1 100%;box-sizing:border-box;background:#17121f;border:1px solid #2a2639;border-radius:12px;padding:12px 14px;color:#ece9f6;font:500 14px/1.4 system-ui,sans-serif;text-align:left';
+  var row = function (txt, css) { var d = document.createElement('div'); d.textContent = txt; if (css) d.style.cssText = css; card.appendChild(d); return d; };
+  row(L('Ende von Kapitel ', 'End of chapter ') + t.n + ' · ' + (left ? left + L(' offen', ' unread') : L('aufgeholt', 'all caught up')), 'font-weight:700;color:#fff');
+  if (left) return card;
+  if (e.ss === 'done') row(L('Die Serie ist abgeschlossen.', 'The series is completed.'), 'color:#ffc21a');
+  else if (e.ss === 'hiatus') row(L('Die Serie pausiert gerade (Hiatus).', 'The series is on hiatus.'), 'color:#ffc21a');
+  else if (e.nx) row(L('Nächstes Kapitel ~', 'Next chapter ~') + new Date(e.nx).toLocaleDateString(L('de-DE', 'en-GB'), { weekday: 'short', day: 'numeric', month: 'short' }), 'color:#ffc21a');
+  var mine = (get(RATE)[t.key] || {}).r || e.rt;
+  if (!mine) {
+    row(L('Wie fandest du sie bisher?', 'How do you like it so far?'), 'margin-top:8px;color:#9893b0;font-size:13px');
+    var stars = document.createElement('div'); stars.style.cssText = 'display:flex;gap:4px;margin-top:6px;flex-wrap:wrap';
+    for (var i = 1; i <= 10; i++) (function (v) {
+      var b = document.createElement('button'); b.type = 'button'; b.textContent = v;
+      b.style.cssText = 'flex:1;min-width:26px;height:34px;border:0;border-radius:8px;background:#2a2639;color:#ece9f6;font:700 13px system-ui,sans-serif';
+      b.addEventListener('click', function (ev) {
+        ev.preventDefault(); var all = get(RATE); all[t.key] = { r: v, t: Date.now() }; put(RATE, keep(all, 30));
+        stars.textContent = '★ ' + v + L(' gespeichert, geht an den Hub', ' saved, goes to your hub'); stars.style.cssText = 'margin-top:6px;color:#ffc21a';
+      });
+      stars.appendChild(b);
+    })(i);
+    card.appendChild(stars);
+  }
+  if (e.q && e.q.u) {
+    var a = document.createElement('a'); a.href = e.q.u; a.textContent = L('Als Nächstes: ', 'Up next: ') + e.q.t + ' · ' + L('Kapitel ', 'Chapter ') + e.q.n + ' ›';
+    a.style.cssText = 'display:block;margin-top:10px;padding:10px 12px;border-radius:10px;background:#913fe2;color:#fff;text-decoration:none;font-weight:700';
+    a.addEventListener('click', function () { leaveChapter(); });
+    card.appendChild(a);
+  }
+  return card;
 }
 function blockPopups() {
   var w = GM.uw; if (!w) return;
@@ -516,7 +597,7 @@ function prepareReader(cb) {
 var DESK = !!(window.matchMedia && matchMedia('(pointer: fine)').matches);
 function prefs() {
   var p = {}; try { p = JSON.parse(GM_getValue('mhub_prefs', '{}')) || {}; } catch (e) {}
-  return { auto: p.auto || 'key', speed: p.speed || 2, wheel: +p.wheel || 1, click: p.click !== false, swipe: p.swipe !== false, preload: p.preload !== false, width: +p.width || 820 };
+  return { auto: p.auto || 'key', speed: p.speed || 2, wheel: +p.wheel || 1, click: p.click !== false, swipe: p.swipe !== false, preload: p.preload !== false, width: +p.width || 820, endless: p.endless !== false };
 }
 // Bildbreite im Modus „Nur Bilder“ (Regler im Hub). 1600 heißt: volle Breite
 function applyWidth() {
@@ -650,7 +731,7 @@ function fetchChapter(u) {
     fin();
   }).catch(function () { e.state = 'none'; fin(); });
   // Höchstens 8 Kapitel merken
-  var ks = Object.keys(pre); if (ks.length > 8) ks.sort(function (a, b) { return pre[a].t - pre[b].t; }).slice(0, ks.length - 8).forEach(function (k) { if (k !== u) delete pre[k]; });
+  var ks = Object.keys(pre).filter(function (k) { return !pre[k].keep; }); if (ks.length > 8) ks.sort(function (a, b) { return pre[a].t - pre[b].t; }).slice(0, ks.length - 8).forEach(function (k) { if (k !== u) delete pre[k]; });
   return e;
 }
 // Wartet, bis ein Kapitel geholt ist (höchstens ms), dann cb(eintrag) oder cb(null)
@@ -756,6 +837,7 @@ function swapChapter(url, p, dir, swiped) {
   var u = new URL(url, location.href), a = ancFor(url, p.imgs);
   rememberCurrent();
   visitAct = !swiped; actScroll = 0; actY = 0;
+  dropNext();
   if (readerObs) { readerObs.disconnect(); readerObs = null; }
   reader.innerHTML = ''; readerSrcs = {};
   p.imgs.forEach(function (src, k) {
@@ -842,6 +924,103 @@ window.addEventListener('touchend', swipeEnd, { passive: true, capture: true });
 window.addEventListener('touchcancel', swipeEnd, { passive: true, capture: true });
 // Zurück-Taste nach einem Wechsel ohne Laden: Seite sauber neu laden
 window.addEventListener('popstate', function () { if (inlineNav) location.reload(); });
+/* ---------- Endlos lesen (Einstellung „endless“, Modus „Nur Bilder“) ----------
+   Kurz vor dem Kapitelende hängt das nächste Kapitel unter die Kapitel-Knöpfe (#mhub-next). Scrollst du hinein, wird es
+   übergeben (handoff): das alte Kapitel gilt als fertig, seine Bilder fallen oben weg, die Stelle auf dem Bildschirm bleibt
+   gleich. Danach ist alles wie bei einem normal geöffneten Kapitel (Anker, Stand, Wischen). */
+var nextBox = null, nextBusy = false, noNextFor = '';
+function dropNext() { if (nextBox && nextBox.parentNode) nextBox.parentNode.removeChild(nextBox); nextBox = null; nextBusy = false; }
+function endlessTick() {
+  if (!reader || !isChapter() || restoring || sliding || preparing) return;
+  if (nextBox) return checkHandoff();
+  if (nextBusy || noNextFor === path || !prefs().endless) return;
+  var de = document.documentElement;
+  if (window.scrollY + window.innerHeight < de.scrollHeight - window.innerHeight * 1.5) return;
+  // Neuestes Kapitel: nicht bei jedem Scrollen neu suchen
+  var t = chapterTargets(); if (!t || !t.next) { noNextFor = path; return; }
+  nextBusy = true;
+  var myPath = path;
+  whenReady(t.next, 8000, function (p) {
+    nextBusy = false;
+    if (p && path === myPath && reader && !nextBox) appendNext(t.next, t.nextN, p);
+    else if (!p) noNextFor = myPath;
+  });
+}
+function appendNext(url, n, p) {
+  var b = document.createElement('div'); b.id = 'mhub-next'; b._url = url; b._p = p;
+  var h = document.createElement('div'); h.textContent = L('Kapitel ', 'Chapter ') + n;
+  h.style.cssText = 'max-width:var(--mhub-w,820px);margin:0 auto;padding:26px 12px 16px;color:#9893b0;font:700 14px system-ui,sans-serif;text-align:center';
+  b.appendChild(h);
+  p.imgs.forEach(function (src, k) { var im = document.createElement('img'); im.src = src; im.alt = ''; im.decoding = 'async'; if (k > 2) im.loading = 'lazy'; b.appendChild(im); });
+  document.body.appendChild(b); nextBox = b;
+  if (dock.parentNode) document.body.appendChild(dock);
+}
+// Übergabe, sobald der Anfang des neuen Kapitels über die Lese-Linie (30 % der Bildschirmhöhe) gescrollt ist
+function checkHandoff() {
+  var first = nextBox.querySelector('img'); if (!first) return;
+  var top = first.getBoundingClientRect().top;
+  if (top <= window.innerHeight * REF) handoff(first, top);
+}
+function handoff(first, top) {
+  var b = nextBox, p = b._p, u = new URL(b._url, location.href);
+  cur = 100; curA = null; dirty = true; visitAct = true; save(true);
+  rememberCurrent();
+  if (readerObs) { readerObs.disconnect(); readerObs = null; }
+  var imgs = [].slice.call(b.querySelectorAll('img'));
+  reader.innerHTML = ''; readerSrcs = {};
+  imgs.forEach(function (im) { readerSrcs[im.getAttribute('src')] = 1; reader.appendChild(im); });
+  b.parentNode.removeChild(b); nextBox = null;
+  if (readerNav && readerNav.parentNode) readerNav.parentNode.removeChild(readerNav);
+  inlineNav = true; path = u.pathname; curDoc = p.doc;
+  try { history.replaceState({ mhub: 1 }, '', u.pathname + u.search); } catch (e) {}
+  if (p.doc && p.doc.title) document.title = p.doc.title;
+  readerNav = chapterNav(); if (readerNav) { document.body.appendChild(readerNav); document.body.appendChild(dock); }
+  // Im selben Schritt zurückscrollen: das erste neue Bild steht wieder genau dort, wo es war
+  window.scrollTo(0, first.getBoundingClientRect().top + window.scrollY - top);
+  resetBox();
+  var sp = savedSpot(); startTiming(sp.e); readT = Date.now();
+  cur = 0; curA = null; dirty = true; savedT = sp.pct; savedA = sp.anc; visitAct = true; actScroll = 0;
+  pill.textContent = '📖 0 %';
+  onScroll();
+  setTimeout(prefetchNeighbors, 300);
+}
+
+/* ---------- Vorrat für unterwegs (Knopf ⬇ in der Leiste, Modus „Nur Bilder“) ----------
+   Holt die nächsten STOCK_N Kapitel samt allen Bildern. Die Bilder bleiben im Speicher dieses Tabs (p.held) und
+   kommen beim Wischen oder Endlos-Lesen ohne Netz. Die Kapitel sind vor dem Aufräumen des Kapitel-Speichers geschützt (p.keep). */
+var STOCK_N = 5, stocking = false;
+function loadImgs(list, cb) {
+  var i = 0, ok = 0, active = 0, held = [];
+  var pump = function () {
+    if (i >= list.length && !active) return cb(ok, held);
+    while (active < 3 && i < list.length) {
+      var im = new Image(); active++; held.push(im);
+      im.onload = function () { ok++; active--; pump(); };
+      im.onerror = function () { active--; pump(); };
+      im.src = list[i++];
+    }
+  };
+  pump();
+}
+function stockUp() {
+  if (stocking || !reader) return;
+  stocking = true;
+  var n = 0, pics = 0, t = chapterTargets(), url = t && t.next;
+  var done = function () { stocking = false; flash(n ? '⬇ ' + n + L(' Kapitel bereit (', ' chapters ready (') + pics + L(' Bilder)', ' images)') : L('Kein weiteres Kapitel gefunden', 'No further chapter found')); };
+  (function step() {
+    if (!url || n >= STOCK_N) return done();
+    flash('⬇ ' + L('Lade Kapitel ', 'Loading chapter ') + (n + 1) + '/' + STOCK_N + ' …');
+    whenReady(url, 15000, function (p) {
+      if (!p) return done();
+      p.keep = true;
+      loadImgs(p.imgs, function (ok, held) {
+        p.held = held; pics += ok; n++;
+        var nt = chapterTargets(p.doc, new URL(p.url).pathname);
+        url = nt && nt.next; step();
+      });
+    });
+  })();
+}
 /* ---------- Lesestand: messen, speichern, an die Stelle springen ---------- */
 // Bilderblock des Kapitels: kleinster Behälter mit den meisten großen Bildern. Läuft bei jedem Scrollen und ist
 // deshalb gemerkt. Neu gesucht wird, wenn sich die Bildanzahl ändert, ohne Treffer höchstens alle 300 ms
@@ -853,7 +1032,7 @@ function findBox() {
   imgCount = imgs.length; boxAt = Date.now(); box = null; bigImgs = [];
   var big = [];
   // Bilder der Wisch-Vorschau gehören nicht zum Kapitel
-  for (var i = 0; i < imgs.length; i++) if (imgs[i].clientWidth >= 250 && !(peek && peek.contains(imgs[i]))) big.push(imgs[i]);
+  for (var i = 0; i < imgs.length; i++) if (imgs[i].clientWidth >= 250 && !(peek && peek.contains(imgs[i])) && !(nextBox && nextBox.contains(imgs[i]))) big.push(imgs[i]);
   if (big.length < 3) return null;
   var need = Math.max(3, Math.floor(big.length * 0.8)), el = big[0].parentElement;
   while (el && el !== document.body) {
@@ -926,6 +1105,7 @@ function save(force) {
 }
 function update() {
   queued = false;
+  endlessTick();
   if (!isChapter()) return;
   if (restoring || preparing) return;
   var p = measure();
@@ -972,36 +1152,65 @@ pill.addEventListener('click', function () {
   if (savedT > 2 && savedT < 95 && Math.abs(cur - savedT) > 1) restore(savedT, savedA);
   else flash(savedT > 2 && savedT < 95 ? L('Du bist schon an deiner Stelle', 'You are already at your spot') : L('Noch keine gespeicherte Stelle', 'No saved spot yet'));
 });
-/* ---------- Cover der Serienseite verkleinert merken ---------- */
-function shrink(src, W, H, cb) {
+/* ---------- Cover der Serienseite merken ----------
+   Bis 600×800, damit es auch auf Handys mit hoher Pixeldichte scharf ist (nie größer als das Original).
+   Stark verkleinert wird in Halbschritten, sonst wirkt das Bild krisselig. Das Ergebnis bleibt unter 170 000
+   Zeichen, damit es in ein Cloud-Dokument passt. COVER_Q: Qualitätsstufe; ältere Cover werden einmal neu geholt. */
+function coverData(bmp, maxW) {
+  var W = Math.min(maxW || COVER_W, Math.max(Math.min(360, maxW || 360), Math.round(bmp.width))), H = Math.round(W * COVER_H / COVER_W);
+  var k = Math.max(W / bmp.width, H / bmp.height), w = bmp.width * k, h = bmp.height * k;
+  var src = bmp, sw = bmp.width, sh = bmp.height;
+  while (sw / 2 >= w) {
+    var t = document.createElement('canvas'); t.width = Math.round(sw / 2); t.height = Math.round(sh / 2);
+    var tg = t.getContext('2d'); tg.imageSmoothingQuality = 'high'; tg.drawImage(src, 0, 0, t.width, t.height);
+    src = t; sw = t.width; sh = t.height;
+  }
+  var c = document.createElement('canvas'); c.width = W; c.height = H;
+  var g = c.getContext('2d'); g.imageSmoothingEnabled = true; g.imageSmoothingQuality = 'high';
+  g.drawImage(src, (W - w) / 2, (H - h) / 2, w, h);
+  var d = '', qs = [0.86, 0.78, 0.7, 0.6];
+  for (var i = 0; i < qs.length; i++) {
+    d = c.toDataURL('image/webp', qs[i]);
+    if (d.indexOf('data:image/webp') !== 0) d = c.toDataURL('image/jpeg', qs[i] + 0.04);
+    if (d.length < 170000) break;
+  }
+  return d;
+}
+// maxW: kleinere Vorschau (Entdecken)
+function shrink(src, cb, maxW) {
   GM_xmlhttpRequest({ method: 'GET', url: src, responseType: 'blob', timeout: 15000,
     onload: function (res) {
       if (res.status !== 200 || !res.response) return cb('');
-      createImageBitmap(res.response).then(function (bmp) {
-        var c = document.createElement('canvas'); c.width = W; c.height = H;
-        var k = Math.max(W / bmp.width, H / bmp.height), w = bmp.width * k, h = bmp.height * k;
-        c.getContext('2d').drawImage(bmp, (W - w) / 2, (H - h) / 2, w, h);
-        c.getContext('2d').imageSmoothingQuality = 'high';
-        var d = c.toDataURL('image/webp', 0.84);
-        if (d.indexOf('data:image/webp') !== 0) d = c.toDataURL('image/jpeg', 0.86);
-        cb(d);
-      }).catch(function () { cb(''); });
+      createImageBitmap(res.response).then(function (bmp) { cb(coverData(bmp, maxW)); }).catch(function () { cb(''); });
     },
     onerror: function () { cb(''); }, ontimeout: function () { cb(''); } });
 }
+// Bestes Cover der Seite: das Bild zum og:image (mit größter Variante aus srcset), sonst das größte Hochformat-Bild
+// oben auf der Seite, dessen Alt-Text zum Titel passt, sonst og:image
+function pageCoverUrl() {
+  var og = document.querySelector('meta[property="og:image"],meta[name="twitter:image"]'), ogU = og && og.content ? unproxy(og.content) : '';
+  var base = function (u) { return String(u).split(/[?#]/)[0].split('/').pop(); };
+  var title = (document.querySelector('h1') || {}).textContent || '', best = null, bw = 0;
+  [].forEach.call(document.images, function (im) {
+    var nw = im.naturalWidth, nh = im.naturalHeight; if (!nw || !nh) return;
+    var r = im.getBoundingClientRect(); if (r.top + window.scrollY > 1800 || r.width < 100) return;
+    var ar = nw / nh, u = bestSrc(im); if (!u || ar < 0.5 || ar > 0.9) return;
+    var sc = nw + (ogU && base(u) === base(ogU) ? 1e5 : 0) + (title && im.alt && normT(im.alt) === normT(title) ? 5e4 : 0);
+    if (sc > bw) { bw = sc; best = u; }
+  });
+  return best || ogU;
+}
 function grabCover(force) {
   var key = location.origin + location.pathname, all = get(COV);
-  if (all[key] && !force) return;
-  var m = document.querySelector('meta[property="og:image"],meta[name="twitter:image"]');
-  var t = document.querySelector('meta[property="og:title"]');
-  if (!m || !m.content) { if (force) flash(L('Kein Cover gefunden', 'No cover found')); return; }
-  shrink(m.content, 360, 480, function (d) {
+  if (all[key] && (all[key].q || 0) >= COVER_Q && !force) return;
+  var u = pageCoverUrl(), t = document.querySelector('meta[property="og:title"]');
+  if (!u) { if (force) flash(L('Kein Cover gefunden', 'No cover found')); return; }
+  shrink(u, function (d) {
     if (!d) return;
-    var cur = get(COV); cur[key] = { img: d, title: t ? t.content : document.title, t: Date.now() };
+    var cur = get(COV); cur[key] = { img: d, title: t ? t.content : document.title, t: Date.now(), q: COVER_Q };
     put(COV, keep(cur, 40)); if (force) flash(L('✓ Cover gemerkt', '✓ Cover saved'));
   });
 }
-
 /* ---------- Entdecken: Serien auf Übersichtsseiten einsammeln ---------- */
 var CHNUM = /(?:chapter|chap|ch|episode|ep)[-_\/ .]?(\d+(?:[-_.]\d+)?)/;
 function absUrl(href, base) { try { return new URL(href, base || location.href).href.replace(/[#?].*$/, ''); } catch (e) { return ''; } }
@@ -1093,10 +1302,11 @@ function enrich(c, cb) {
         if (ty) e.type = ty[1].charAt(0).toUpperCase() + ty[1].slice(1).toLowerCase();
         else if (!e.type) e.type = badgeType(doc.body);
         if (!e.type && /\/novels?\//i.test(c.url)) e.type = 'Novel';
+        e.ss = siteStatus(doc);
       }
       var src = (og && og.content) || c.imgSrc;
       if (!src || /^data:/.test(src)) return cb(e);
-      shrink(src, 240, 320, function (d) { e.img = d; cb(e); });
+      shrink(src, function (d) { e.img = d; cb(e); }, 300);
     },
     onerror: function () { cb(null); }, ontimeout: function () { cb(null); } });
 }
@@ -1172,13 +1382,14 @@ function refreshRel() {
   if (mx == null) return;
   var all = get(DISC), e = all[self]; if (!e) return; // Erster Besuch: der Eintrag entsteht gerade beim Entdecken
   var list = Object.keys(rel).map(function (n) { return [parseFloat(n), rel[n]]; }).sort(function (a, b) { return a[0] - b[0]; }).slice(-20);
-  var desc = fullDesc(document), hg = headGenres(document);
-  var sig = JSON.stringify([list, mx, desc.length, hg]);
+  var desc = fullDesc(document), hg = headGenres(document), ss = siteStatus(document);
+  var sig = JSON.stringify([list, mx, desc.length, hg, ss]);
   relDoneFor = path;
   if (e.relSig === sig) return;
   if (list.length) e.rel = list;
   if (desc && desc.length >= (e.desc || '').length) e.desc = desc;
   if (hg.length) e.g = mergeGenres(hg, e.g || []);
+  if (ss) e.ss = ss;
   if (mx > (e.ch || 0)) { e.ch = mx; e.chUrl = mxU; }
   e.relSig = sig; e.ack = false; e.t = Date.now();
   put(DISC, keep(all, 150));
@@ -1289,6 +1500,23 @@ function mergeGenres(a, b) {
   var seen = {}, out = [];
   a.concat(b).forEach(function (g) { var k = g.toLowerCase(); if (!seen[k]) { seen[k] = 1; out.push(g); } });
   return out.slice(0, 20);
+}
+// Status der Serie auf der Seite („Status: Ongoing / Completed / Hiatus / Dropped“), auch als Beschriftung mit Wert daneben.
+// Ergebnis: ongoing, done, hiatus, dropped oder ''
+var STATUS_WORDS = [[/\b(completed?|finished|ended|abgeschlossen|beendet)\b/i, 'done'], [/\b(hiatus|on.?hold|paused|pausiert|season end)\b/i, 'hiatus'],
+  [/\b(dropped|cancell?ed|discontinued|abgebrochen|eingestellt)\b/i, 'dropped'], [/\b(ongoing|on.?going|publishing|releasing|laufend)\b/i, 'ongoing']];
+function siteStatus(root) {
+  // Text mit Leerzeichen zwischen den Teilen, sonst wird aus „Status“ + „Completed“ ein Wort
+  var spaced = function (el) { var w = el.ownerDocument.createTreeWalker(el, 4), out = [], n; while ((n = w.nextNode())) out.push(n.nodeValue); return out.join(' ').replace(/\s+/g, ' ').trim(); };
+  var els = root.querySelectorAll('h1,h2,h3,h4,h5,h6,span,div,dt,th,td,b,strong,p,label,li');
+  for (var i = 0; i < els.length; i++) {
+    var el = els[i]; if (el.childElementCount > 3) continue;
+    var t = spaced(el); if (t.length > 40) continue;
+    var m = t.match(/^(?:status|stand)\s*:?\s*(.*)$/i); if (!m) continue;
+    var val = m[1] || (el.nextElementSibling ? spaced(el.nextElementSibling) : '');
+    for (var k = 0; k < STATUS_WORDS.length; k++) if (STATUS_WORDS[k][0].test(val.slice(0, 40))) return STATUS_WORDS[k][1];
+  }
+  return '';
 }
 /* ---------- Serienseite: Stand aus dem Hub, Weiterlesen, gelesene Kapitel markieren ---------- */
 var card = null, cardKey = '', libRaw = '', libList = [];
@@ -1416,7 +1644,7 @@ function route() {
   save(true);
   teardownReader();
   asStop(true);
-  pre = {}; curDoc = null; dropPeek();
+  pre = {}; curDoc = null; dropPeek(); dropNext();
   path = location.pathname; resetBox();
   if (card) { card.remove(); card = null; }
   if (isChapter()) openChapter(); else openPage();
