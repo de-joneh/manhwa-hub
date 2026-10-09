@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.46.0
+// @version      3.47.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.46.0';
+var VERSION = '3.47.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -44,6 +44,12 @@ var STATUS_WORDS = [[/\b(completed?|finished|ended|abgeschlossen|beendet)\b/i, '
 // Beschriftung alternativer Namen („Alternative:“, „Associated Names“ …), Gruppe 1 = Doppelpunkt
 var ALT_LABEL = /^(?:alternative(?:\s+(?:titles?|names?))?|alt(?:\.|ernative)?\s*names?|associated\s+names?|other\s+names?|also\s+known\s+as|aka|synonyms?|alternativ(?:e)?\s*(?:titel|namen)?)\b\s*(:)?\s*/i;
 function cutEnd(t) { return /(\.\.\.|…)\s*$/.test(t); }
+/* Eine Serie unter einer Adresse: Asura verlinkt dieselbe Serie mal mit, mal ohne Kennung am Ende („overgeared-bd5bdaf8“
+   und „overgeared“), beide funktionieren. Die Kennung (8 Hex-Zeichen mit Ziffer und Buchstabe) fällt weg. Kapitel-Adressen
+   bleiben, wie sie sind. Gleiche Regel im Hub (canonUrl in 06-link). */
+function canonUrl(u) {
+  return String(u || '').replace(/^(https?:\/\/[^\/]+\/(?:[^\/?#]+\/)*[^\/?#]+?)-([0-9a-f]{8})(\/?)$/i, function (m, a, h, sl) { return /\d/.test(h) && /[a-f]/i.test(h) ? a + sl : m; });
+}
 function hostOf(u) { try { return new URL(u).hostname; } catch (e) { return ''; } }
 // Datensparmodus aus den Lese-Einstellungen (ohne prefs() aus 04-pc, das im Hub-Teil nicht läuft)
 function saveMode() { try { return (JSON.parse(GM_getValue('mhub_prefs', '{}')) || {}).save === true; } catch (e) { return false; } }
@@ -1378,7 +1384,7 @@ function onlySeries(el, key, base) {
   var as = el.querySelectorAll('a[href]');
   for (var i = 0; i < as.length; i++) {
     var u = absUrl(as[i].getAttribute('href'));
-    if (isSeriesUrl(u)) { if (u.replace(/\/$/, '') !== key) return false; }
+    if (isSeriesUrl(u)) { if (canonUrl(u.replace(/\/$/, '')) !== key) return false; }
     else if (chOf(u) != null && pathOf(u).toLowerCase().indexOf(base) < 0) return false;
   }
   return true;
@@ -1404,7 +1410,7 @@ function scrapeCards() {
   document.querySelectorAll('a[href]').forEach(function (a) {
     var u = absUrl(a.getAttribute('href'));
     if (!isSeriesUrl(u) || new URL(u).hostname !== location.hostname) return;
-    var k = u.replace(/\/$/, ''); (map[k] = map[k] || []).push(a);
+    var k = canonUrl(u.replace(/\/$/, '')); (map[k] = map[k] || []).push(a);
   });
   Object.keys(map).forEach(function (k) {
     var as = map[k], base = slugBase(k), card = null;
@@ -1446,7 +1452,7 @@ function scrapeCards() {
 }
 // Fund mit Details anreichern: Serienseite holen (oder, wenn du gerade darauf bist, die offene Seite nehmen)
 function enrich(c, cb) {
-  if (c.url === (location.origin + location.pathname).replace(/\/$/, '')) return fromDoc(c, document, cb);
+  if (c.url === canonUrl((location.origin + location.pathname).replace(/\/$/, ''))) return fromDoc(c, document, cb);
   GM_xmlhttpRequest({ method: 'GET', url: c.url, timeout: 15000,
     onload: function (r) {
       var doc = null;
@@ -1477,14 +1483,18 @@ function fromDoc(c, doc, cb) {
       }
     });
     e.rel = Object.keys(rel).map(function (n) { return [parseFloat(n), rel[n]]; }).sort(function (a, b) { return a[0] - b[0]; }).slice(-20);
+    // Seite zeichnet die Kapitelliste erst im Browser: Kapitel und Daten aus den Seitendaten
+    if (!e.rel.length) applyJsonChapters(e, doc, c.url);
     e.desc = fullDesc(doc);
     e.g = mergeGenres(headGenres(doc), e.g);
+    if (!e.g.length) e.g = jsonGenres(doc);
     var bt = doc.body ? (doc.body.textContent || '').slice(0, 40000) : '';
     var ty = bt.match(/(?:type|typ)\s*:?\s*(manhwa|manga|manhua|novel|webtoon)/i);
     if (ty) e.type = ty[1].charAt(0).toUpperCase() + ty[1].slice(1).toLowerCase();
     else if (!e.type) e.type = badgeType(doc.body);
+    if (!e.type) e.type = jsonType(doc);
     if (!e.type && /\/novels?\//i.test(c.url)) e.type = 'Novel';
-    e.ss = siteStatus(doc);
+    e.ss = siteStatus(doc) || jsonStatus(doc);
     e.alt = altNames(doc);
   }
   // 400 px breit: scharf in der Entdecken-Liste auch bei hoher Pixeldichte; hervorgehobene (fürs Karussell) 600 px.
@@ -1559,7 +1569,7 @@ var relDoneFor = '', relPath = '', relSince = 0;
 function refreshRel() {
   if (relDoneFor === path || isChapter() || !SERIES.test(path)) return;
   if (relPath !== path) { relPath = path; relSince = Date.now(); }
-  var self = (location.origin + path).replace(/\/$/, ''), base = slugBase(self), rel = {}, mx = null, mxU = null;
+  var self = canonUrl((location.origin + path).replace(/\/$/, '')), base = slugBase(self), rel = {}, mx = null, mxU = null;
   document.querySelectorAll('a[href]').forEach(function (a) {
     var u = absUrl(a.getAttribute('href')), n = chOf(u);
     if (n == null || pathOf(u).toLowerCase().indexOf(base) < 0) return;
@@ -1568,10 +1578,14 @@ function refreshRel() {
   });
   // Ohne Kapitel-Links erst, wenn die Seite fertig geladen sein dürfte (Seiten, die Inhalte nachladen)
   if (mx == null && Date.now() - relSince < 6000) return;
+  // Keine Daten an den Links: aus den Seitendaten
+  var jc = !Object.keys(rel).length ? jsonChapters(document) : null;
+  if (jc) { rel = jc.rel; if (mx == null || jc.max > mx) { mx = jc.max; if (jc.slug) mxU = self + '/' + jc.slug; } }
   var all = get(DISC), e = all[self]; if (!e) return; // Erster Besuch: der Eintrag entsteht gerade beim Entdecken
   relDoneFor = path;
   var list = Object.keys(rel).map(function (n) { return [parseFloat(n), rel[n]]; }).sort(function (a, b) { return a[0] - b[0]; }).slice(-20);
-  var desc = fullDesc(document), hg = headGenres(document), ss = siteStatus(document), alt = altNames(document);
+  var desc = fullDesc(document), hg = headGenres(document), ss = siteStatus(document) || jsonStatus(document), alt = altNames(document);
+  if (!hg.length && !(e.g && e.g.length)) hg = jsonGenres(document);
   var sig = JSON.stringify([list, mx, desc.length, hg, ss, alt]);
   var light = !e.desc && !(e.g && e.g.length), noImg = !e.q && !saveMode();
   if (e.relSig !== sig) {
@@ -1580,7 +1594,8 @@ function refreshRel() {
     if (hg.length) e.g = mergeGenres(hg, e.g || []);
     if (ss) e.ss = ss;
     if (alt.length) e.alt = alt;
-    if (mx != null && mx > (e.ch || 0)) { e.ch = mx; e.chUrl = mxU; }
+    if (mx != null && mx > (e.ch || 0) && mxU && (!jc || !e.chUrl || e.chUrl.indexOf(self + '/') === 0)) { e.ch = mx; e.chUrl = mxU; }
+    if (!e.type) e.type = jsonType(document);
     var ot = document.querySelector('meta[property="og:title"]');
     if (light && ot && ot.content) e.title = ot.content;
     e.relSig = sig; e.ack = false; e.t = Date.now();
@@ -1593,6 +1608,16 @@ function refreshRel() {
     cur.img = n.img; cur.q = n.q; if (n.iu) cur.iu = n.iu; cur.ack = false; cur.t = Date.now();
     put(DISC, keep(a2, DISC_KEEP));
   });
+}
+// Einmalig (ab 3.47): gemerkte Funde unter der Adresse ohne Kennung ablegen (canonUrl), sonst würde alles neu abgerufen
+function canonMigrate() {
+  if (GM_getValue('mhub_canon', 0) >= 1) return;
+  var all = get(DISC), ch = false;
+  Object.keys(all).forEach(function (k) { var c = canonUrl(k); if (c !== k) { if (!all[c]) all[c] = all[k]; delete all[k]; ch = true; } });
+  if (ch) put(DISC, all);
+  var q = dqGet(), q2 = q.map(function (x) { return Object.assign({}, x, { url: canonUrl(x.url) }); });
+  if (JSON.stringify(q) !== JSON.stringify(q2)) dqPut(q2);
+  GM_setValue('mhub_canon', 1);
 }
 // Diese Serienseite selbst zum Entdecken vormerken (vorne in der Warteschlange)
 function queueSelf(self) {
@@ -1608,7 +1633,7 @@ function lightEntry(c) {
 var knownRaw = '', knownSet = {};
 function isKnown(u) {
   var raw = GM_getValue('mhub_known', '[]');
-  if (raw !== knownRaw) { knownRaw = raw; knownSet = {}; try { (JSON.parse(raw) || []).forEach(function (x) { knownSet[x] = 1; }); } catch (e) {} }
+  if (raw !== knownRaw) { knownRaw = raw; knownSet = {}; try { (JSON.parse(raw) || []).forEach(function (x) { knownSet[canonUrl(x)] = 1; }); } catch (e) {} }
   return !!knownSet[u];
 }
 // Kurzer Hinweis unten in der Leiste, nur auf Scan-Seiten (im Hub gibt es die Leiste nicht)
@@ -1720,18 +1745,169 @@ function ldDescs(root) {
   });
   return out;
 }
-// Volle Beschreibung in den Daten der Seite (Next.js, Nuxt …): eine Zeichenkette in einem Skript, die wie der Anfang der
-// Kurzbeschreibung beginnt. Auch doppelt verpackt (JSON in einer JS-Zeichenkette, z. B. self.__next_f.push).
+/* Seitendaten als Text: die Next.js-Daten (self.__next_f.push) werden in der Reihenfolge zusammengesetzt und einmal
+   entpackt (lange Zeichenketten können über mehrere push-Aufrufe verteilt sein), dazu __NEXT_DATA__, Nuxt und andere
+   Inline-Skripte. Viele Seiten bauen den sichtbaren Inhalt erst im Browser: dann stehen Genres, Status, Kapitel nur hier. */
+var pdCache = typeof WeakMap === 'function' ? new WeakMap() : null;
+function pageTexts(root) {
+  if (pdCache && pdCache.has(root)) return pdCache.get(root);
+  var flight = [], other = [];
+  [].forEach.call(root.querySelectorAll('script:not([src])'), function (sc) {
+    var t = sc.textContent || '';
+    if (!t || t.length > 4000000 || /ld\+json/.test(sc.type || '')) return;
+    var re = /self\.__next_f\.push\(\[1,\s*("(?:[^"\\]|\\.)*")\]\)/g, m, hit = false;
+    while ((m = re.exec(t))) { try { flight.push(JSON.parse(m[1])); hit = true; } catch (e) {} }
+    if (!hit) other.push(t);
+  });
+  var out = (flight.length ? [flight.join('')] : []).concat(other);
+  if (pdCache) pdCache.set(root, out);
+  return out;
+}
+// Ende eines JSON-Arrays/-Objekts ab s (Zeichenketten beachtet), -1 wenn nicht innerhalb von max Zeichen
+function jsonEnd(t, s, max) {
+  var depth = 0, inS = false;
+  for (var i = s; i < t.length && i - s < max; i++) {
+    var c = t.charAt(i);
+    if (inS) { if (c === '\\') i++; else if (c === '"') inS = false; continue; }
+    if (c === '"') inS = true;
+    else if (c === '[' || c === '{') depth++;
+    else if ((c === ']' || c === '}') && --depth === 0) return i;
+  }
+  return -1;
+}
+// Stelle der Serie in den Seitendaten (ihr Titel): von mehreren Listen gilt die nächstgelegene (nicht die Genre-Liste im Menü)
+function anchorOf(t, title) { var k = String(title || '').replace(/\s+/g, ' ').trim().slice(0, 40); return k.length >= 3 ? t.indexOf(k) : -1; }
+function pageTitle(root) {
+  var h = root.querySelector('h1'), og = root.querySelector('meta[property="og:title"]');
+  return (h && h.textContent.trim()) || (og && og.content) || '';
+}
+// Genres aus den Seitendaten ("genres"/"tags"/"categories": [..] mit Namen oder als Text) und aus JSON-LD (genre)
+function jsonGenres(root) {
+  var best = null, bd = 1e12, title = pageTitle(root);
+  pageTexts(root).forEach(function (t) {
+    if (!/"(?:genres?|tags|categories)"/i.test(t)) return;
+    var an = anchorOf(t, title), re = /"(?:genres?|tags|categories|genre_list|genreList)"\s*:\s*\[/gi, m, n = 0;
+    while ((m = re.exec(t)) && n++ < 200) {
+      var s = m.index + m[0].length - 1, e = jsonEnd(t, s, 8000); if (e < 0) continue;
+      var arr; try { arr = JSON.parse(t.slice(s, e + 1)); } catch (er) { continue; }
+      var names = [];
+      (Array.isArray(arr) ? arr : []).forEach(function (x) {
+        var v = typeof x === 'string' ? x : x && typeof x === 'object' ? (x.name || x.title || x.label || x.genre || x.tag) : '';
+        if (typeof v !== 'string') return; v = v.replace(/\s+/g, ' ').trim();
+        if (v.length >= 2 && v.length <= 30 && v.charAt(0) !== '$' && !/^\d+$/.test(v)) names.push(v);
+      });
+      // Eine Liste aller Genres der Seite (Menü, Filter) ist lang: nur kurze Listen
+      if (!names.length || names.length > 15) continue;
+      var dist = an < 0 ? 0 : Math.abs(m.index - an);
+      if (dist < bd) { bd = dist; best = names; }
+    }
+  });
+  if (!best) {
+    [].forEach.call(root.querySelectorAll('script[type="application/ld+json"]'), function (sc) {
+      if (best) return;
+      try {
+        (function walk(o, depth) {
+          if (best || !o || typeof o !== 'object' || depth > 6) return;
+          var g = o.genre || o.genres; if (typeof g === 'string') g = g.split(/\s*,\s*/);
+          if (Array.isArray(g)) { var l = g.filter(function (x) { return typeof x === 'string' && x.length >= 2 && x.length <= 30; }); if (l.length && l.length <= 15) { best = l; return; } }
+          Object.keys(o).forEach(function (k) { if (o[k] && typeof o[k] === 'object') walk(o[k], depth + 1); });
+        })(JSON.parse(sc.textContent || ''), 0);
+      } catch (e) {}
+    });
+  }
+  return best ? mergeGenres(best, []) : [];
+}
+// Status und Art aus den Seitendaten, nahe beim Titel
+function jsonField(root, re) {
+  var best = '', bd = 1e12, title = pageTitle(root);
+  pageTexts(root).forEach(function (t) {
+    var an = anchorOf(t, title), m, n = 0; re.lastIndex = 0;
+    while ((m = re.exec(t)) && n++ < 200) { var d = an < 0 ? 0 : Math.abs(m.index - an); if (d < bd) { bd = d; best = m[1]; } }
+  });
+  return best;
+}
+function jsonStatus(root) {
+  var v = jsonField(root, /"(?:status|series_status|seriesStatus|publication_status)"\s*:\s*"([^"]{3,30})"/gi);
+  for (var k = 0; v && k < STATUS_WORDS.length; k++) if (STATUS_WORDS[k][0].test(v)) return STATUS_WORDS[k][1];
+  return '';
+}
+function jsonType(root) {
+  var v = jsonField(root, /"(?:series_type|seriesType|comic_type|comicType|type)"\s*:\s*"(manhwa|manga|manhua|novel|webtoon)"/gi);
+  return v ? v.charAt(0).toUpperCase() + v.slice(1).toLowerCase() : '';
+}
+/* Kapitel mit Datum aus den Seitendaten: flache Objekte, die eine Kapitelnummer (Feld oder „Chapter 62“/„chapter-62“) und
+   ein Datum haben. Für Seiten, die die Kapitelliste erst im Browser zeichnen. Ergebnis: {rel: {n: Tag}, max, slug} */
+function jsonChapters(root) {
+  var rel = {}, cnt = 0, mx = null, slug = '', n = 0, now = Date.now();
+  var NUM = /"(?:chapter_number|chapterNumber|chapter_no|chapterNo|number|chapter)"\s*:\s*"?(\d{1,5}(?:\.\d+)?)"?\s*[,}]/;
+  var SLUG = /"(?:chapter_slug|chapterSlug|slug)"\s*:\s*"((?:chapter|ch|episode|ep)[._-]*(\d{1,5})(?:[._-](\d{1,2}))?(?![\d])[a-z0-9._-]{0,60})"/i;
+  var NAME = /"(?:chapter_slug|chapterSlug|slug|chapter_name|chapterName|name|title)"\s*:\s*"((?:chapter|ch|episode|ep)[\s._-]*(\d{1,5})(?:[._-](\d{1,2}))?(?![\d])[^"]{0,60})"/i;
+  var DATE = /"(?:created_at|createdAt|published_at|publishedAt|release_date|releaseDate|released_at|releasedAt|uploaded_at|uploadedAt|date|updated_at|updatedAt)"\s*:\s*"([^"]{8,40})"/;
+  pageTexts(root).forEach(function (t) {
+    if (!/hapter|pisode/.test(t)) return;
+    // Von jedem Datumsfeld aus das umgebende flache Objekt nehmen (schneller als alle Objekte der Seite durchzugehen)
+    var re = new RegExp(DATE.source, 'g'), m;
+    while ((m = re.exec(t)) && n++ < 4000) {
+      var a = t.lastIndexOf('{', m.index), z = t.indexOf('}', m.index);
+      if (a < 0 || z < 0 || m.index - a > 1500 || z - m.index > 1500) continue;
+      var o = t.slice(a, z + 1); if (o.indexOf('{', 1) > -1 || !/chapter|episode/i.test(o)) continue;
+      var d = o.match(DATE); if (!d) continue;
+      var nu = o.match(NUM), nm = o.match(SLUG) || o.match(NAME);
+      var num = nu ? parseFloat(nu[1]) : nm ? parseFloat(nm[2] + (nm[3] ? '.' + nm[3] : '')) : NaN;
+      if (isNaN(num) || num > 20000) continue;
+      var tm = Date.parse(d[1]); if (isNaN(tm) || tm > now + 864e5 || tm < now - 6 * 365 * 864e5) continue;
+      if (rel[num] == null) { rel[num] = dayOf(tm); cnt++; }
+      if (mx == null || num > mx) { mx = num; slug = nm && /^[a-z0-9._-]+$/i.test(nm[1]) ? nm[1] : ''; }
+    }
+  });
+  return cnt ? { rel: rel, max: mx, slug: slug, n: cnt } : null;
+}
+// Kapitel aus den Seitendaten in einen Eintrag übernehmen (nur wenn die Seite selbst keine Kapitel-Links mit Datum zeigt).
+// Link zum neuesten Kapitel nur, wenn das Muster bekannt ist (Serienadresse + „/chapter-62“ wie beim bisherigen Link)
+function applyJsonChapters(e, root, pageUrl) {
+  var jc = jsonChapters(root); if (!jc) return false;
+  e.rel = Object.keys(jc.rel).map(function (n) { return [parseFloat(n), jc.rel[n]]; }).sort(function (a, b) { return a[0] - b[0]; }).slice(-20);
+  var pre = String(pageUrl || '').replace(/\/$/, '') + '/';
+  if (jc.slug && jc.max > (e.ch || 0) && (!e.chUrl || e.chUrl.indexOf(pre) === 0)) { e.ch = jc.max; e.chUrl = pre + jc.slug; }
+  return true;
+}
+// Alternative Namen aus den Seitendaten ("alternative_names": "A, B" oder [..])
+function jsonAlt(root) {
+  var out = [];
+  pageTexts(root).forEach(function (t) {
+    if (out.length) return;
+    var re = /"(?:alternative_names|alternativeNames|alt_names|altNames|alternative_titles|alternativeTitles|alternatives|other_names|otherNames|associated_names|synonyms)"\s*:\s*/g, m;
+    while (!out.length && (m = re.exec(t))) {
+      var s = m.index + m[0].length, c = t.charAt(s), v = null;
+      try {
+        if (c === '"') { var e = s + 1; while (e < t.length && e - s < 3000 && !(t.charAt(e) === '"' && t.charAt(e - 1) !== '\\')) e++; v = JSON.parse(t.slice(s, e + 1)); }
+        else if (c === '[') { var e2 = jsonEnd(t, s, 4000); if (e2 > 0) v = JSON.parse(t.slice(s, e2 + 1)); }
+      } catch (er) { v = null; }
+      if (typeof v === 'string') v = v.split(/\s*(?:[,;|•\n]|\s\/\s)\s*/);
+      if (Array.isArray(v)) out = v.map(function (x) { return typeof x === 'string' ? x : x && (x.name || x.title) || ''; }).map(function (x) { return String(x).replace(/\s+/g, ' ').trim(); })
+        .filter(function (x) { return x.length >= 2 && x.length <= 150 && x.charAt(0) !== '$'; });
+    }
+  });
+  return out.slice(0, 12);
+}
+// Volle Beschreibung in den Seitendaten: eine Zeichenkette, die wie der Anfang der Kurzbeschreibung beginnt. In den
+// zusammengesetzten Next.js-Daten auch als Textzeile („1a:T4d2,…“, für lange Texte); in anderen Skripten auch doppelt verpackt
 function scriptDescs(root, meta) {
   var out = [], key = '';
   // Suchschlüssel: ein Stück vom Anfang ohne Satzzeichen, die in JSON anders aussehen könnten
   (meta.slice(0, 120).match(/[A-Za-z0-9 ,]{16,}/g) || []).forEach(function (m) { if (!key && m.trim().length >= 16) key = m.trim().slice(0, 40); });
   if (!key) return out;
   var quoteAt = function (t, i) { var b = 0; while (i - 1 - b >= 0 && t.charAt(i - 1 - b) === '\\') b++; return b; };
-  [].forEach.call(root.querySelectorAll('script:not([src])'), function (sc) {
-    var t = sc.textContent || '', at = 0, n = 0;
-    if (t.length > 4000000 || /ld\+json/.test(sc.type || '')) return;
+  pageTexts(root).forEach(function (t) {
+    var at = 0, n = 0;
     while ((at = t.indexOf(key, at)) > -1 && n++ < 20) {
+      // Textzeile der Next.js-Daten: „<id>:T<Länge in Bytes, hex>,“ direkt davor
+      var tr = t.slice(Math.max(0, at - 200), at).match(/(?:^|[\n\]}])[0-9a-f]{1,6}:T([0-9a-f]{1,6}),([^\n]{0,190})$/);
+      if (tr) {
+        var len = parseInt(tr[1], 16), st = at - tr[2].length, b = 0, i = st;
+        for (; i < t.length && b < len && i - st < 20000; i++) { var cc = t.charCodeAt(i); b += cc < 0x80 ? 1 : cc < 0x800 ? 2 : (cc >= 0xD800 && cc < 0xDC00) ? (i++, 4) : 3; }
+        out.push(t.slice(st, i));
+      }
       // Anfang der Zeichenkette: ein " davor (einfach) oder \" (doppelt verpackt); ein paar Möglichkeiten durchprobieren
       for (var a = at - 1, tries = 0; a >= 0 && at - a < 600 && tries < 4; a--) {
         if (t.charAt(a) !== '"') continue;
@@ -1868,6 +2044,8 @@ function altNames(root) {
     var pe = h1.parentElement;
     if (!raw.length && pe && pe.childElementCount <= 4) { tryNear(pe.previousElementSibling); tryNear(pe.nextElementSibling); }
   }
+  // 4. Seitendaten ("alternative_names" …), z. B. wenn die Seite den Inhalt erst im Browser zeichnet
+  if (!raw.length) { var ja = jsonAlt(root); if (ja.length) raw.push(ja.join('\n')); }
   var out = [], seen = {};
   // Getrennt mit • ; | / oder Zeilen; bei einer Beschriftung ohne diese Zeichen auch mit Komma („A, B, C“)
   var all = raw.join('\n'), sep = comma && !/[•·;|\n]|\s\/\s/.test(all) ? /\s*,\s+/ : /\s*[•·;|\n]\s*|\s+\/\s+/;
@@ -1961,7 +2139,7 @@ function cardBtn(label, fn, main) {
 }
 function seriesCard() {
   if (isChapter() || !SERIES.test(path)) { if (card) { card.remove(); card = null; } return; }
-  var self = (location.origin + path).replace(/\/$/, ''), base = slugBase(self), key = base.replace(/[^a-z0-9]/g, '');
+  var self = canonUrl((location.origin + path).replace(/\/$/, '')), base = slugBase(self), key = base.replace(/[^a-z0-9]/g, '');
   var e = libEntry(key), links = chapLinks(base), st = e ? seriesState(e, base) : null;
   // Kapitelliste: gelesene abdunkeln, aktuelles gelb umranden
   links.forEach(function (x) {
@@ -2124,9 +2302,10 @@ function openPage() {
   pill.style.display = 'none'; cleanBtn.style.display = 'none';
   cardKey = ''; setTimeout(seriesCard, 800);
   clearTimeout(dockT); dock.style.opacity = '1'; dock.style.pointerEvents = 'auto';
+  canonMigrate();
   if (SERIES.test(path)) {
     setTimeout(function () { grabCover(false); }, 1500);
-    var self = (location.origin + path).replace(/\/$/, '');
+    var self = canonUrl((location.origin + path).replace(/\/$/, ''));
     if (!get(DISC)[self]) queueSelf(self);
   }
   clearTimeout(discT); discT = setTimeout(discover, 1200);
