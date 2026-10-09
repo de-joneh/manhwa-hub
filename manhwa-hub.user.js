@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.44.0
+// @version      3.45.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.44.0';
+var VERSION = '3.45.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -1810,9 +1810,22 @@ function altNames(root) {
   // 3. Zeile direkt über oder unter dem Titel mit mehreren Namen: mit „•“ getrennt (Asura) oder mit Komma (Vortex: über dem
   //    Titel „대마법사 커리큘럼, The Archmage Curriculum“). Nur, wenn es nach Namen aussieht: jeder Teil kurz, nicht klein
   //    anfangend, kein Satz (kein Fließtext)
-  var looksList = function (t, sep) {
-    var ps = t.split(sep); if (ps.length < 2 || t.length > 500 || /[.!?]\s+\S/.test(t)) return false;
+  var looksList = function (t, sep, one) {
+    var ps = t.split(sep); if (ps.length < (one ? 1 : 2) || t.length > 500 || /[.!?]\s+\S/.test(t)) return false;
     return ps.every(function (x) { return x && x.length <= 120 && !/^[a-z]/.test(x); });
+  };
+  // Auch ein einzelner Name oder eine kleine Abwandlung des Titels („Archmage's Curriculum“): mindestens ein wichtiges
+  // Wort des Titels kommt vor, kurz, kein Satz, keine Seitenbeschriftung (Kapitel, Lesen, Wertung, Brotkrumen …)
+  var STOP = /^(the|and|for|with|from|his|her|its|you|your|are|was|who|how|not|but|der|die|das|und|von|des|les|del)$/;
+  var words = function (s) { return String(s).toLowerCase().split(/[^\p{L}\p{N}']+/u).map(function (w) { return w.replace(/'s?$/, ''); }).filter(function (w) { return w.length >= 3 && !STOP.test(w); }); };
+  var tw = words(h1 ? h1.textContent : '');
+  var near = function (x) {
+    x = x.trim(); if (!x || x.length > 100 || /^[a-z]/.test(x)) return false;
+    if (/[.!?]\s+\S|[>›»|]|chapter|episode|kapitel|\bch\.?\s*\d|\bread\b|online|scans?\b|manga\b|manhwa\b|manhua\b|webtoon|novel|status|rating|author|artist|genre|bookmark|follow|views?\b|release|update/i.test(x)) return false;
+    var ws = x.split(/\s+/); if (ws.length > 10) return false;
+    // Fließtext hat viele klein geschriebene Wörter (Verben usw.), Namen kaum
+    if (ws.filter(function (w) { return /^[a-z]{4,}/.test(w) && !STOP.test(w); }).length > 1) return false;
+    var xw = words(x); return xw.some(function (w) { return tw.indexOf(w) >= 0; });
   };
   var tryLine = function (el) {
     if (raw.length || !el || el === h1 || el.querySelector && el.querySelector('h1')) return;
@@ -1821,10 +1834,23 @@ function altNames(root) {
     if (/\s[•·]\s/.test(t) && looksList(t, /\s*[•·]\s*/)) raw.push(t);
     else if (/,\s/.test(t) && looksList(t, /\s*,\s+/)) { raw.push(t); comma = true; }
   };
+  var tryNear = function (el) {
+    if (raw.length || !el || el === h1 || el.querySelector && el.querySelector('h1') || el.childElementCount > 4) return;
+    var t = (el.textContent || '').replace(/\s+/g, ' ').replace(/[\s^˄˅▲▼⌃⌄›»]+$/, '').trim();
+    if (!t || t.length > 300 || normT(t) === title) return;
+    var sep = /\s[•·]\s/.test(t) ? /\s*[•·]\s*/ : /,\s/.test(t) ? /\s*,\s+/ : /\s+\/\s+/;
+    if (looksList(t, sep, true) && t.split(sep).some(near) && t.split(sep).every(function (x) { return x.trim().length <= 100; })) { raw.push(t); if (/,\s/.test(t) && !/[•·]/.test(t)) comma = true; }
+  };
   if (!raw.length && h1) {
-    for (var el = h1.previousElementSibling, i = 0; el && i < 2; el = el.previousElementSibling, i++) tryLine(el);
-    for (el = h1.nextElementSibling, i = 0; el && i < 3; el = el.nextElementSibling, i++) tryLine(el);
-    if (!raw.length && h1.parentElement) [].forEach.call(h1.parentElement.children, tryLine);
+    var around = function (f) {
+      for (var el = h1.previousElementSibling, i = 0; el && i < 2; el = el.previousElementSibling, i++) f(el);
+      for (el = h1.nextElementSibling, i = 0; el && i < 3; el = el.nextElementSibling, i++) f(el);
+      if (!raw.length && h1.parentElement) [].forEach.call(h1.parentElement.children, f);
+    };
+    around(tryLine);
+    if (!raw.length) around(tryNear);
+    var pe = h1.parentElement;
+    if (!raw.length && pe && pe.childElementCount <= 4) { tryNear(pe.previousElementSibling); tryNear(pe.nextElementSibling); }
   }
   var out = [], seen = {};
   // Getrennt mit • ; | / oder Zeilen; bei einer Beschriftung ohne diese Zeichen auch mit Komma („A, B, C“)
