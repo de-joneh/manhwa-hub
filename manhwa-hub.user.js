@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.47.0
+// @version      3.48.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.47.0';
+var VERSION = '3.48.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -503,7 +503,7 @@ function addReaderImgs(list) {
     n.src = src; n.alt = ''; n.decoding = 'async';
     if (reader.children.length > 3) n.loading = 'lazy';
     var w = +im.getAttribute('width'), hgt = +im.getAttribute('height');
-    if (w > 0 && hgt > 0) { n.width = w; n.height = hgt; }
+    if (w > 0 && hgt > 0) { n.width = w; n.height = hgt; n.setAttribute('data-ok', '1'); } else holdSpace(n, guessRatio());
     reader.appendChild(n); added++;
   });
   return added;
@@ -517,14 +517,17 @@ function buildReader() {
   // Bilder ohne normale Adresse (z. B. auf Canvas gezeichnet): Lesemodus hier nicht möglich
   if (addReaderImgs(srcImgs) < 3) { reader = null; return 'skip'; }
   readerStyle = document.createElement('style');
-  readerStyle.textContent = 'html,body{background:#000!important;overflow-x:hidden!important;overflow-y:auto!important;margin:0!important}' +
-    'body>*:not(#mhub-reader):not(#mhub-dock):not(#mhub-nav):not(#mhub-peek):not(#mhub-fade):not(#mhub-next):not(#mhub-ask){display:none!important}' +
+  // scroll-behavior: manche Seiten scrollen weich (CSS) – dann wären Sprünge des Lesers als schnelles Scrollen zu sehen
+  readerStyle.textContent = 'html,body{background:#000!important;overflow-x:hidden!important;overflow-y:auto!important;margin:0!important;scroll-behavior:auto!important}' +
+    'body>*:not(#mhub-reader):not(#mhub-dock):not(#mhub-nav):not(#mhub-peek):not(#mhub-fade):not(#mhub-next):not(#mhub-prev):not(#mhub-ask){display:none!important}' +
     '#mhub-nav{display:flex!important;flex-wrap:wrap;gap:8px;max-width:var(--mhub-w,820px);margin:0 auto;padding:18px 12px 120px;background:#000;font:700 15px system-ui,sans-serif}' +
     '#mhub-nav a{flex:1;display:flex;align-items:center;justify-content:center;min-height:52px;border-radius:12px;background:#2a2639;color:#ece9f6;text-decoration:none;text-align:center;padding:0 10px}' +
     '#mhub-nav a.nx{background:#913fe2;color:#fff;flex:1.4}#mhub-nav span{flex:1.4;display:flex;align-items:center;justify-content:center;color:#9893b0}' +
     // pan-y: der Browser scrollt senkrecht selbst und muss nie auf das Skript warten; waagerecht gehört dem Wischen
     '#mhub-reader{display:block!important;background:#000;padding:0;margin:0;touch-action:pan-y pinch-zoom}' +
-    '#mhub-reader img,#mhub-next img{display:block;width:100%;max-width:var(--mhub-w,820px);height:auto;margin:0 auto;border:0}#mhub-next{display:block!important;background:#000}';
+    '#mhub-reader img,#mhub-next img,#mhub-prev img{display:block;width:100%;max-width:var(--mhub-w,820px);height:auto;margin:0 auto;border:0}#mhub-next,#mhub-prev{display:block!important;background:#000}' +
+    // Noch nicht geladene Bilder nie als Scroll-Anker nehmen (ihre Höhe ändert sich noch)
+    '#mhub-reader img:not([data-ok]),#mhub-next img:not([data-ok]){overflow-anchor:none}';
   applyWidth();
   (document.head || document.documentElement).appendChild(readerStyle);
   document.body.appendChild(reader);
@@ -827,7 +830,7 @@ function rememberCurrent() {
   if (imgs.length >= 3) pre[u] = { state: 'ok', url: u, imgs: imgs, doc: curDoc || document, w: [], t: Date.now() };
 }
 function moveReader(x, ms) {
-  [reader, readerNav].forEach(function (el) {
+  [reader, readerNav, prevBox, prevNav].forEach(function (el) {
     if (!el) return;
     el.style.transition = ms ? 'transform ' + ms + 'ms ease-out' : 'none';
     el.style.transform = x ? 'translateX(' + x + 'px)' : '';
@@ -913,10 +916,12 @@ function swapChapter(url, p, dir, swiped) {
   visitAct = !swiped; actScroll = 0; actY = 0;
   dropNext();
   if (readerObs) { readerObs.disconnect(); readerObs = null; }
+  var ratio = guessRatio();
   reader.innerHTML = ''; readerSrcs = {};
   p.imgs.forEach(function (src, k) {
     readerSrcs[src] = 1;
     var n = document.createElement('img'); n.src = src; n.alt = ''; n.decoding = a && k >= a.i - 1 && k <= a.i + 2 ? 'sync' : 'async'; if (k > (a ? a.i + 3 : 3)) n.loading = 'lazy';
+    holdSpace(n, ratio);
     reader.appendChild(n);
   });
   // Erst den eigenen Pfad setzen, dann die Adresse: so baut route() nichts neu auf
@@ -1001,10 +1006,20 @@ window.addEventListener('touchcancel', swipeEnd, { passive: true, capture: true 
 window.addEventListener('popstate', function () { if (inlineNav) location.reload(); });
 /* ---------- Endlos lesen (Einstellung „endless“, Modus „Nur Bilder“) ----------
    Kurz vor dem Kapitelende hängt das nächste Kapitel unter die Kapitel-Knöpfe (#mhub-next). Scrollst du hinein, wird es
-   übergeben (handoff): das alte Kapitel gilt als fertig, seine Bilder fallen oben weg, die Stelle auf dem Bildschirm bleibt
-   gleich. Danach ist alles wie bei einem normal geöffneten Kapitel (Anker, Stand, Wischen). */
-var nextBox = null, nextBusy = false, noNextFor = '';
-function dropNext() { if (nextBox && nextBox.parentNode) nextBox.parentNode.removeChild(nextBox); nextBox = null; nextBusy = false; }
+   übergeben (handoff): das alte Kapitel gilt als fertig, das neue ist ab jetzt der Leser (Anker, Stand, Wischen).
+   Beim Übergeben ändert sich am Bild nichts: kein Umbau, kein Scrollen, so bleibt ein laufender Wisch-Schwung (Firefox:
+   asynchron) ungestört. Das alte Kapitel (#mhub-prev) fällt erst weg, wenn du kurz nicht scrollst und es weit genug
+   oben liegt; die Stelle wird dabei im selben Schritt ausgeglichen. */
+var nextBox = null, nextBusy = false, noNextFor = '', prevBox = null, prevNav = null, prevT = 0, lastScrollAt = 0, touchOn = false;
+function dropNext() { if (nextBox && nextBox.parentNode) nextBox.parentNode.removeChild(nextBox); nextBox = null; nextBusy = false; dropPrev(); }
+function dropPrev() {
+  clearTimeout(prevT);
+  [prevBox, prevNav].forEach(function (el) { if (el && el.parentNode) el.parentNode.removeChild(el); });
+  prevBox = null; prevNav = null;
+}
+window.addEventListener('scroll', function () { lastScrollAt = Date.now(); }, { passive: true });
+window.addEventListener('touchstart', function () { touchOn = true; }, { passive: true, capture: true });
+['touchend', 'touchcancel'].forEach(function (ev) { window.addEventListener(ev, function () { touchOn = false; lastScrollAt = Date.now(); }, { passive: true, capture: true }); });
 function endlessTick() {
   if (!reader || !isChapter() || restoring || sliding || preparing) return;
   if (nextBox) return checkHandoff();
@@ -1021,43 +1036,80 @@ function endlessTick() {
     else if (!p) noNextFor = myPath;
   });
 }
+// Seitenverhältnis noch nicht geladener Bilder: wie die schon geladenen (Mittelwert), damit sie gleich ungefähr so hoch
+// sind wie später. Sonst wären sie 0 hoch, und beim Nachladen verschiebt sich alles (der Browser hält evtl. ein falsches
+// Bild fest: man springt nach vorn)
+function guessRatio() {
+  var ims = reader ? reader.querySelectorAll('img') : [], rs = [];
+  for (var i = 0; i < ims.length && rs.length < 40; i++) if (ims[i].complete && ims[i].naturalWidth > 200) rs.push(ims[i].naturalHeight / ims[i].naturalWidth);
+  if (!rs.length) return '800 / 1200';
+  rs.sort(function (x, y) { return x - y; });
+  return '1000 / ' + Math.round(rs[rs.length >> 1] * 1000);
+}
+function holdSpace(im, ratio) {
+  if (im.complete && im.naturalWidth) { im.setAttribute('data-ok', '1'); return; }
+  im.style.aspectRatio = 'auto ' + ratio;
+  var ok = function () { im.setAttribute('data-ok', '1'); im.style.aspectRatio = ''; };
+  im.addEventListener('load', ok); im.addEventListener('error', ok);
+}
 function appendNext(url, n, p) {
   var b = document.createElement('div'); b.id = 'mhub-next'; b._url = url; b._p = p;
-  var h = document.createElement('div'); h.textContent = L('Kapitel ', 'Chapter ') + n;
+  var h = document.createElement('div'); h.className = 'mhub-chhead'; h.textContent = L('Kapitel ', 'Chapter ') + n;
   h.style.cssText = 'max-width:var(--mhub-w,820px);margin:0 auto;padding:26px 12px 16px;color:#9893b0;font:700 14px system-ui,sans-serif;text-align:center';
   b.appendChild(h);
-  p.imgs.forEach(function (src, k) { var im = document.createElement('img'); im.src = src; im.alt = ''; im.decoding = 'async'; if (k > 2) im.loading = 'lazy'; b.appendChild(im); });
+  var ratio = guessRatio();
+  // Die ersten Bilder gleich laden: beim Übergang sind sie fertig und haben ihre Höhe
+  p.imgs.forEach(function (src, k) { var im = document.createElement('img'); im.src = src; im.alt = ''; im.decoding = 'async'; if (k > 5) im.loading = 'lazy'; holdSpace(im, ratio); b.appendChild(im); });
   document.body.appendChild(b); nextBox = b;
   if (dock.parentNode) document.body.appendChild(dock);
 }
 // Übergabe, sobald der Anfang des neuen Kapitels über die Lese-Linie (30 % der Bildschirmhöhe) gescrollt ist
 function checkHandoff() {
   var first = nextBox.querySelector('img'); if (!first) return;
-  var top = first.getBoundingClientRect().top;
-  if (top <= window.innerHeight * REF) handoff(first, top);
+  if (first.getBoundingClientRect().top <= window.innerHeight * REF) handoff();
 }
-function handoff(first, top) {
+function handoff() {
   var b = nextBox, p = b._p, u = new URL(b._url, location.href);
   cur = 100; curA = null; dirty = true; visitAct = true; save(true);
   rememberCurrent();
   if (readerObs) { readerObs.disconnect(); readerObs = null; }
-  var imgs = [].slice.call(b.querySelectorAll('img'));
-  reader.innerHTML = ''; readerSrcs = {};
-  imgs.forEach(function (im) { readerSrcs[im.getAttribute('src')] = 1; reader.appendChild(im); });
-  b.parentNode.removeChild(b); nextBox = null;
-  if (readerNav && readerNav.parentNode) readerNav.parentNode.removeChild(readerNav);
+  // Noch ein älteres Kapitel oben? Das jetzt entfernen (liegt weit oben), mit Ausgleich
+  if (prevBox) trimPrev();
+  // Altes Kapitel bleibt vorerst stehen, das neue wird der Leser. Nichts wird verschoben
+  prevBox = reader; prevBox.id = 'mhub-prev'; prevNav = readerNav;
+  reader = b; b.id = 'mhub-reader'; nextBox = null; readerSrcs = {};
+  [].forEach.call(b.querySelectorAll('img'), function (im) { readerSrcs[im.getAttribute('src')] = 1; });
+  ['click', 'mousedown', 'mouseup', 'touchend', 'pointerup', 'auxclick'].forEach(function (ev) { b.addEventListener(ev, function (e) { e.stopPropagation(); }, true); });
   inlineNav = true; path = u.pathname; curDoc = p.doc;
   try { history.replaceState({ mhub: 1 }, '', u.pathname + u.search); } catch (e) {}
   if (p.doc && p.doc.title) document.title = p.doc.title;
+  // Neue Knöpfe ans Ende (unter das neue Kapitel, weit unten: verschiebt nichts Sichtbares)
   readerNav = chapterNav(); if (readerNav) { document.body.appendChild(readerNav); document.body.appendChild(dock); }
-  // Im selben Schritt zurückscrollen: das erste neue Bild steht wieder genau dort, wo es war
-  window.scrollTo(0, first.getBoundingClientRect().top + window.scrollY - top);
   resetBox();
   var sp = savedSpot(); startTiming(sp.e); readT = Date.now();
   cur = 0; curA = null; dirty = true; savedT = sp.pct; savedA = sp.anc; visitAct = true; actScroll = 0;
   pill.textContent = '📖 0 %';
   onScroll();
+  prevLater();
   setTimeout(prefetchNeighbors, 300);
+}
+// Altes Kapitel entfernen, sobald du kurz nicht scrollst (kein Finger auf dem Bildschirm, kein Schwung mehr) und der
+// Anfang des neuen Kapitels mindestens eine Bildschirmhöhe über dem Bildschirm liegt
+function prevLater() {
+  clearTimeout(prevT);
+  prevT = setTimeout(function () {
+    if (!prevBox || !reader) return;
+    if (touchOn || Date.now() - lastScrollAt < 900 || sliding || restoring || reader.getBoundingClientRect().top > -window.innerHeight) return prevLater();
+    trimPrev();
+  }, 500);
+}
+function trimPrev() {
+  var ref = reader.querySelector('img') || reader, t0 = ref.getBoundingClientRect().top;
+  dropPrev();
+  // Der Browser hält die Stelle evtl. schon selbst (Scroll-Anker); sonst hier ohne Bewegung ausgleichen
+  var d = ref.getBoundingClientRect().top - t0;
+  if (Math.abs(d) >= 1) window.scrollTo({ top: window.scrollY + d, left: 0, behavior: 'instant' });
+  resetBox(); onScroll();
 }
 
 /* ---------- Vorrat für unterwegs (Knopf ⬇ in der Leiste, Modus „Nur Bilder“) ----------
@@ -1107,7 +1159,7 @@ function findBox() {
   imgCount = imgs.length; boxAt = Date.now(); box = null; bigImgs = [];
   var big = [];
   // Bilder der Wisch-Vorschau gehören nicht zum Kapitel
-  for (var i = 0; i < imgs.length; i++) if (imgs[i].clientWidth >= 250 && !(peek && peek.contains(imgs[i])) && !(nextBox && nextBox.contains(imgs[i]))) big.push(imgs[i]);
+  for (var i = 0; i < imgs.length; i++) if (imgs[i].clientWidth >= 250 && !(peek && peek.contains(imgs[i])) && !(nextBox && nextBox.contains(imgs[i])) && !(prevBox && prevBox.contains(imgs[i]))) big.push(imgs[i]);
   if (big.length < 3) return null;
   var need = Math.max(3, Math.floor(big.length * 0.8)), el = big[0].parentElement;
   while (el && el !== document.body) {
