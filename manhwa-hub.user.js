@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.45.0
+// @version      3.46.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.45.0';
+var VERSION = '3.46.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -1552,9 +1552,13 @@ function linkDate(a) {
   return t;
 }
 // Auf der Serienseite: Kapitel und Daten aus der angezeigten Seite neu lesen und an den Hub geben
-var relDoneFor = '';
+/* Bei jedem Öffnen der Serienseite: alles aus der offenen Seite neu lesen (Kapitel, Daten, Beschreibung, Genres, Status,
+   alternative Namen) und Fehlendes nachholen: kein Cover (q 0, z. B. schneller Eintrag von der Karte oder früher
+   misslungen) wird aus der offenen Seite geholt, ein Titel nur von der Karte durch den der Seite ersetzt. */
+var relDoneFor = '', relPath = '', relSince = 0;
 function refreshRel() {
   if (relDoneFor === path || isChapter() || !SERIES.test(path)) return;
+  if (relPath !== path) { relPath = path; relSince = Date.now(); }
   var self = (location.origin + path).replace(/\/$/, ''), base = slugBase(self), rel = {}, mx = null, mxU = null;
   document.querySelectorAll('a[href]').forEach(function (a) {
     var u = absUrl(a.getAttribute('href')), n = chOf(u);
@@ -1562,21 +1566,33 @@ function refreshRel() {
     if (mx == null || n > mx) { mx = n; mxU = u; }
     var dt = linkDate(a); if (dt && !rel[n]) rel[n] = dt;
   });
-  if (mx == null) return;
+  // Ohne Kapitel-Links erst, wenn die Seite fertig geladen sein dürfte (Seiten, die Inhalte nachladen)
+  if (mx == null && Date.now() - relSince < 6000) return;
   var all = get(DISC), e = all[self]; if (!e) return; // Erster Besuch: der Eintrag entsteht gerade beim Entdecken
+  relDoneFor = path;
   var list = Object.keys(rel).map(function (n) { return [parseFloat(n), rel[n]]; }).sort(function (a, b) { return a[0] - b[0]; }).slice(-20);
   var desc = fullDesc(document), hg = headGenres(document), ss = siteStatus(document), alt = altNames(document);
   var sig = JSON.stringify([list, mx, desc.length, hg, ss, alt]);
-  relDoneFor = path;
-  if (e.relSig === sig) return;
-  if (list.length) e.rel = list;
-  if (desc && desc.length >= (e.desc || '').length) e.desc = desc;
-  if (hg.length) e.g = mergeGenres(hg, e.g || []);
-  if (ss) e.ss = ss;
-  if (alt.length) e.alt = alt;
-  if (mx > (e.ch || 0)) { e.ch = mx; e.chUrl = mxU; }
-  e.relSig = sig; e.ack = false; e.t = Date.now();
-  put(DISC, keep(all, DISC_KEEP));
+  var light = !e.desc && !(e.g && e.g.length), noImg = !e.q && !saveMode();
+  if (e.relSig !== sig) {
+    if (list.length) e.rel = list;
+    if (desc && desc.length >= (e.desc || '').length) e.desc = desc;
+    if (hg.length) e.g = mergeGenres(hg, e.g || []);
+    if (ss) e.ss = ss;
+    if (alt.length) e.alt = alt;
+    if (mx != null && mx > (e.ch || 0)) { e.ch = mx; e.chUrl = mxU; }
+    var ot = document.querySelector('meta[property="og:title"]');
+    if (light && ot && ot.content) e.title = ot.content;
+    e.relSig = sig; e.ack = false; e.t = Date.now();
+    put(DISC, keep(all, DISC_KEEP));
+  }
+  if (!noImg) return;
+  // Cover fehlt: aus der offenen Seite holen (die Bilder sind meist schon geladen)
+  fromDoc({ url: self, title: e.title, rating: e.rating, ch: e.ch, chUrl: e.chUrl, feat: e.feat, type: e.type, imgSrc: e.iu || '' }, document, function (n) {
+    var a2 = get(DISC), cur = a2[self]; if (!cur || !n || !n.img) return;
+    cur.img = n.img; cur.q = n.q; if (n.iu) cur.iu = n.iu; cur.ack = false; cur.t = Date.now();
+    put(DISC, keep(a2, DISC_KEEP));
+  });
 }
 // Diese Serienseite selbst zum Entdecken vormerken (vorne in der Warteschlange)
 function queueSelf(self) {
