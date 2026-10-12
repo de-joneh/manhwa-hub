@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.49.3
+// @version      3.49.4
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.49.3';
+var VERSION = '3.49.4';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -79,6 +79,9 @@ function slugOfPath(p) {
 // Schlüssel aus dem Namen der Adresse, für Romane mit „novel“ am Ende
 function novelKey(key, p) { return key && /\/novels?\//i.test(p || '') && !/novel$/.test(key) ? key + 'novel' : key; }
 function isNovelUrl(u) { return /\/novels?\//i.test(u || '') || /-novel(?:[\/?#]|-(?:chapter|ch|episode|ep)\b|$)/i.test(u || ''); }
+// Kapitel-Link derselben Art wie die Serie: Comic-Seiten verlinken oft den Roman („Read the Novel“ → /novels/…/chapter/211,
+// Thunder: …-novel-chapter-317) und umgekehrt. Mit gleichem Namen in der Adresse fielen diese Kapitel sonst in die falsche Serie
+function sameKind(u, ref) { return isNovelUrl(u) === isNovelUrl(ref); }
 function seriesKeyOf(u) {
   var p = ''; try { p = new URL(u).pathname; try { p = decodeURIComponent(p); } catch (e) {} } catch (e) { return ''; }
   return slugOfPath(p.toLowerCase()).replace(/[^a-z0-9]/g, '');
@@ -1517,7 +1520,7 @@ function scrapeCards() {
     var chN = null, chU = null;
     card.querySelectorAll('a[href]').forEach(function (a) {
       var u = absUrl(a.getAttribute('href')), n = chOf(u);
-      if (n != null && (chN == null || n > chN)) { chN = n; chU = u; }
+      if (n != null && sameKind(u, k) && (chN == null || n > chN)) { chN = n; chU = u; }
     });
     // Steht die Karte in einem Slider/Karussell (oben auf der Startseite der Scan-Seite), ist sie gerade hervorgehoben
     var feat = !!(card.closest && card.closest(FEAT_SEL));
@@ -1548,6 +1551,7 @@ function fromDoc(c, doc, cb) {
       var hrf = (a.getAttribute('href') || '').toLowerCase();
       var u = absUrl(a.getAttribute('href'), c.url), n = chOf(u);
       if (n != null && pathOf(u).toLowerCase().indexOf(base) > -1) {
+        if (!sameKind(u, c.url)) return;
         if (e.ch == null || n > e.ch) { e.ch = n; e.chUrl = u; }
         var dt = linkDate(a);
         if (dt && !rel[n]) rel[n] = dt;
@@ -1649,7 +1653,7 @@ function refreshRel() {
   var self = canonUrl((location.origin + path).replace(/\/$/, '')), base = slugBase(self), rel = {}, mx = null, mxU = null;
   document.querySelectorAll('a[href]').forEach(function (a) {
     var u = absUrl(a.getAttribute('href')), n = chOf(u);
-    if (n == null || pathOf(u).toLowerCase().indexOf(base) < 0) return;
+    if (n == null || pathOf(u).toLowerCase().indexOf(base) < 0 || !sameKind(u, self)) return;
     if (mx == null || n > mx) { mx = n; mxU = u; }
     var dt = linkDate(a); if (dt && !rel[n]) rel[n] = dt;
   });
@@ -2201,7 +2205,7 @@ function libEntry(key) {
 // Stand aus dem Hub, ergänzt um das, was du auf diesem Gerät seitdem gelesen hast
 function seriesState(e, base) {
   var st = { r: e.r || 0, c: e.c ? { n: e.c.n, pct: e.c.pct, url: '' } : null, u: e.u || '', n: e.n }, l = get(LOG);
-  Object.keys(l).filter(function (k) { return pathOf(k).toLowerCase().indexOf(base) > -1 && l[k].t > (e.at || 0); })
+  Object.keys(l).filter(function (k) { return pathOf(k).toLowerCase().indexOf(base) > -1 && sameKind(k, location.href) && l[k].t > (e.at || 0); })
     .sort(function (a, b) { return l[a].t - l[b].t; })
     .forEach(function (k) {
       var n = chOf(k); if (n == null) return;
@@ -2217,7 +2221,7 @@ function chapLinks(base) {
   var out = [];
   document.querySelectorAll('a[href]').forEach(function (a) {
     var u = absUrl(a.getAttribute('href')), n = chOf(u);
-    if (n != null && pathOf(u).toLowerCase().indexOf(base) > -1 && new URL(u).hostname === location.hostname) out.push({ a: a, n: n, u: u });
+    if (n != null && pathOf(u).toLowerCase().indexOf(base) > -1 && sameKind(u, location.href) && new URL(u).hostname === location.hostname) out.push({ a: a, n: n, u: u });
   });
   return out;
 }
