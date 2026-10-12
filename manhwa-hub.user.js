@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.48.0
+// @version      3.49.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.48.0';
+var VERSION = '3.49.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -67,8 +67,13 @@ function slugOfPath(p) {
   var s = (i > -1 && seg[i + 1]) ? seg[i + 1] : (seg.filter(function (x) { return /(?:^|-)(?:chapter|chap|ch|episode|ep)-?\d/.test(x); })[0] || seg[0] || '');
   s = s.replace(/[-_]?(?:chapter|chap|ch|episode|ep)[-_]?\d+(?:[-_.]\d+)?.*$/, '');
   s = s.replace(/-[a-z0-9]{8}$/, function (m) { return /\d/.test(m) ? '' : m; });
+  // Romane (/novels/…) sind eigene Serien: Schlüssel endet auf „novel“ (wie im Hub)
+  if (s && i > -1 && /^novels?$/.test(seg[i]) && !/novel$/.test(s)) s += '-novel';
   return s || seg[0] || '';
 }
+// Schlüssel aus dem Namen der Adresse, für Romane mit „novel“ am Ende
+function novelKey(key, p) { return key && /\/novels?\//i.test(p || '') && !/novel$/.test(key) ? key + 'novel' : key; }
+function isNovelUrl(u) { return /\/novels?\//i.test(u || '') || /-novel(?:[\/?#]|-(?:chapter|ch|episode|ep)\b|$)/i.test(u || ''); }
 function seriesKeyOf(u) {
   var p = ''; try { p = new URL(u).pathname; try { p = decodeURIComponent(p); } catch (e) {} } catch (e) { return ''; }
   return slugOfPath(p.toLowerCase()).replace(/[^a-z0-9]/g, '');
@@ -572,7 +577,7 @@ function chapterTargets(root, pth) {
     if (k == null || strip(pathOf(u)) !== me || new URL(u).hostname !== location.hostname) return;
     if (!found[k]) found[k] = u;
   });
-  var key = slugBase(head.replace(/[-_\/]+$/, '')).replace(/[^a-z0-9]/g, ''), e = key ? libEntry(key) : null;
+  var key = novelKey(slugBase(head.replace(/[-_\/]+$/, '')).replace(/[^a-z0-9]/g, ''), pth), e = key ? libEntry(key) : null;
   var make = function (k) { return location.origin + pth.replace(CHPART, function (all, a) { return a + k; }); };
   var prevN = Math.ceil(n) - 1, nextN = Math.floor(n) + 1;
   var prev = found[prevN] || (prevN >= 1 ? make(prevN) : '');
@@ -1489,7 +1494,8 @@ function scrapeCards() {
     if (!title) return;
     var text = card.innerText || card.textContent || '', rating = null, re = /(\d{1,2}[.,]\d{1,2})/g, m;
     while ((m = re.exec(text))) { var v = parseFloat(m[1].replace(',', '.')); if (v > 0 && v <= 10) { rating = v; break; } }
-    var type = badgeType(card) || (/\/novels?\//i.test(k) ? 'Novel' : '');
+    // Roman-Adresse geht vor: ein „Manhwa“-Abzeichen daneben gehört oft zu einer Empfehlung
+    var type = isNovelUrl(k) ? 'Novel' : badgeType(card);
     var chN = null, chU = null;
     card.querySelectorAll('a[href]').forEach(function (a) {
       var u = absUrl(a.getAttribute('href')), n = chOf(u);
@@ -1545,7 +1551,7 @@ function fromDoc(c, doc, cb) {
     if (ty) e.type = ty[1].charAt(0).toUpperCase() + ty[1].slice(1).toLowerCase();
     else if (!e.type) e.type = badgeType(doc.body);
     if (!e.type) e.type = jsonType(doc);
-    if (!e.type && /\/novels?\//i.test(c.url)) e.type = 'Novel';
+    if (isNovelUrl(c.url)) e.type = 'Novel';
     e.ss = siteStatus(doc) || jsonStatus(doc);
     e.alt = altNames(doc);
   }
@@ -2155,7 +2161,8 @@ function libEntry(key) {
   if (raw !== libRaw) { libRaw = raw; try { libList = JSON.parse(raw) || []; } catch (e) { libList = []; } }
   for (var i = 0; i < libList.length; i++) {
     var e = libList[i];
-    if ((e.k || []).some(function (x) { return x === key || (Math.min(x.length, key.length) >= 6 && (x.indexOf(key) > -1 || key.indexOf(x) > -1)); })) return e;
+    // Roman und Comic gleichen Namens sind verschiedene Serien
+    if ((e.k || []).some(function (x) { return x === key || (/novel$/.test(x) === /novel$/.test(key) && Math.min(x.length, key.length) >= 6 && (x.indexOf(key) > -1 || key.indexOf(x) > -1)); })) return e;
   }
   return null;
 }
@@ -2191,7 +2198,7 @@ function cardBtn(label, fn, main) {
 }
 function seriesCard() {
   if (isChapter() || !SERIES.test(path)) { if (card) { card.remove(); card = null; } return; }
-  var self = canonUrl((location.origin + path).replace(/\/$/, '')), base = slugBase(self), key = base.replace(/[^a-z0-9]/g, '');
+  var self = canonUrl((location.origin + path).replace(/\/$/, '')), base = slugBase(self), key = novelKey(base.replace(/[^a-z0-9]/g, ''), path);
   var e = libEntry(key), links = chapLinks(base), st = e ? seriesState(e, base) : null;
   // Kapitelliste: gelesene abdunkeln, aktuelles gelb umranden
   links.forEach(function (x) {
