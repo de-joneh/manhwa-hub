@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.49.2
+// @version      3.49.3
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.49.2';
+var VERSION = '3.49.3';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -50,7 +50,12 @@ function cutEnd(t) { return /(\.\.\.|…)\s*$/.test(t); }
 function canonUrl(u) {
   return String(u || '').replace(/^(https?:\/\/[^\/]+\/(?:[^\/?#]+\/)*[^\/?#]+?)-([0-9a-f]{8})(\/?)$/i, function (m, a, h, sl) { return /\d/.test(h) && /[a-f]/i.test(h) ? a + sl : m; });
 }
-function hostOf(u) { try { return new URL(u).hostname; } catch (e) { return ''; } }
+function hostOf(u) { try { return new URL(u, location.href).hostname; } catch (e) { return ''; } }
+// Dateiname eines Bildes ohne Endung und Größenzusatz („overgeared.905990-400.webp“ → „overgeared.905990“): gleiches Bild in anderer Größe
+function imgStem(u) { return String(u || '').split(/[?#]/)[0].split('/').pop().replace(/\.[a-z0-9]+$/i, '').replace(/[-_](?:\d{2,4}(?:x\d{2,4})?|thumb|small|medium|large)$/i, '').toLowerCase(); }
+// Titel aus og:title ohne Seitennamen („Overgeared | Asura Scans“, „X – Read Online“)
+function ogName(t) { return String(t || '').split(/\s+[|–—]\s+|\s+-\s+(?=read\b|online\b|[^-]*\bscans?\b)/i)[0].replace(/\s+/g, ' ').trim(); }
+function coverStem(doc) { var og = (doc || document).querySelector('meta[property="og:image"]'); return og && og.content ? imgStem(og.content) : ''; }
 // Datensparmodus aus den Lese-Einstellungen (ohne prefs() aus 04-pc, das im Hub-Teil nicht läuft)
 function saveMode() { try { return (JSON.parse(GM_getValue('mhub_prefs', '{}')) || {}).save === true; } catch (e) { return false; } }
 /* Warteschlange zum Entdecken (Seiten, die noch abgerufen werden müssen), im Tampermonkey-Speicher: überlebt das
@@ -768,7 +773,6 @@ if (DESK) {
 var pre = {}, curDoc = null, inlineNav = false, sw0 = null, swHint = null, peek = null;
 // Sichtbare Breite: auf Seiten ohne Handy-Ansicht ist innerWidth die breite Desktop-Fläche
 function viewW() { return Math.min(window.innerWidth, (window.visualViewport && window.visualViewport.width) || window.innerWidth); }
-function hostOf(u) { try { return new URL(u, location.href).hostname; } catch (e) { return ''; } }
 // Bildadressen eines Kapitels: gleiche Bild-Domain wie die aktuellen Seitenbilder, ohne Bilder, die auch sonst auf der Seite stehen
 function imgsFromHtml(html, doc) {
   var mine = Object.keys(readerSrcs); if (!mine.length) return [];
@@ -782,9 +786,8 @@ function imgsFromHtml(html, doc) {
   });
   var og = doc && doc.querySelector('meta[property="og:image"]'); if (og && og.content) skip[unproxy(og.content)] = 1;
   // Gleiches Bild in anderer Größe („overgeared.905990-400.webp“ zum og:image „overgeared.905990.webp“): das Cover, keine Seite
-  var stem = function (u) { return String(u || '').split(/[?#]/)[0].split('/').pop().replace(/\.[a-z0-9]+$/i, '').replace(/[-_](?:\d{2,4}(?:x\d{2,4})?|thumb|small|medium|large)$/i, '').toLowerCase(); };
-  var ogStem = og && og.content ? stem(og.content) : '';
-  var add = function (u) { u = unproxy(u); if (!u || seen[u] || skip[u] || readerSrcs[u] || hostOf(u) !== host || (ogStem && stem(u) === ogStem)) return; seen[u] = 1; out.push(u); };
+  var ogStem = og && og.content ? imgStem(og.content) : '';
+  var add = function (u) { u = unproxy(u); if (!u || seen[u] || skip[u] || readerSrcs[u] || hostOf(u) !== host || (ogStem && imgStem(u) === ogStem)) return; seen[u] = 1; out.push(u); };
   if (doc) [].forEach.call(doc.images, function (im) { var w = +im.getAttribute('width'); if (!w || w >= 250) { var u = bestSrc(im); if (u) add(u); } });
   if (out.length < 3) {
     // Adressen im Seitentext, z. B. in den Daten von Next.js, mit maskierten Zeichen
@@ -1165,16 +1168,22 @@ function findBox() {
   var imgs = document.images;
   if (imgs.length === imgCount && (box ? box.isConnected : Date.now() - boxAt < 300)) return box;
   imgCount = imgs.length; boxAt = Date.now(); box = null; bigImgs = [];
-  var big = [];
-  // Bilder der Wisch-Vorschau gehören nicht zum Kapitel
-  for (var i = 0; i < imgs.length; i++) if (imgs[i].clientWidth >= 250 && !(peek && peek.contains(imgs[i])) && !(nextBox && nextBox.contains(imgs[i])) && !(prevBox && prevBox.contains(imgs[i]))) big.push(imgs[i]);
+  var big = [], cov = coverStem();
+  // Bilder der Wisch-Vorschau gehören nicht zum Kapitel, das Cover der Serie (og:image in anderer Größe) auch nicht
+  for (var i = 0; i < imgs.length; i++) if (imgs[i].clientWidth >= 250 && !(peek && peek.contains(imgs[i])) && !(nextBox && nextBox.contains(imgs[i])) && !(prevBox && prevBox.contains(imgs[i])) && !(cov && imgStem(imgs[i].currentSrc || imgs[i].src) === cov)) big.push(imgs[i]);
   if (big.length < 3) return null;
-  var need = Math.max(3, Math.floor(big.length * 0.8)), el = big[0].parentElement;
-  while (el && el !== document.body) {
-    var n = 0; for (var j = 0; j < big.length; j++) if (el.contains(big[j])) n++;
-    if (n >= need) break; el = el.parentElement;
-  }
-  box = el && el !== document.body ? el : null;
+  // Kleinster Behälter mit mindestens 80 % der großen Bilder. Gesucht von mehreren Bildern aus: steht ein einzelnes großes
+  // Bild (Cover, Banner) vor dem Kapitel, wäre der Behälter vom ersten Bild aus zu groß und es käme mit in den Leser
+  var need = Math.max(3, Math.floor(big.length * 0.8)), best = null, bestN = 1e9;
+  [big[0], big[big.length >> 1], big[big.length - 1]].forEach(function (start) {
+    var el = start.parentElement;
+    while (el && el !== document.body) {
+      var n = 0; for (var j = 0; j < big.length; j++) if (el.contains(big[j])) n++;
+      if (n >= need) { if (n < bestN) { best = el; bestN = n; } break; }
+      el = el.parentElement;
+    }
+  });
+  box = best;
   if (box) bigImgs = big.filter(function (b) { return box.contains(b); });
   return box;
 }
@@ -1249,6 +1258,8 @@ function update() {
   var moved = a && (!curA || a.i !== curA.i || Math.abs(a.f - curA.f) > 0.01);
   if (a) curA = a;
   if (p !== cur || moved) { cur = p; dirty = true; save(false); }
+  // Noch nicht gespeicherte letzte Stelle (Pause unter 2 s nach dem letzten Speichern) nachholen: der Takt ruft update auf
+  else if (dirty) save(false);
   if (Date.now() > flashUntil) { var pt = '📖 ' + cur + ' %'; if (pill.textContent !== pt) pill.textContent = pt; }
 }
 // Beim Öffnen an die letzte Stelle springen. Bilder laden nach, deshalb wird kurz nachjustiert,
@@ -1529,7 +1540,7 @@ function enrich(c, cb) {
 function fromDoc(c, doc, cb) {
   var base = slugBase(c.url);
   var og = doc && doc.querySelector('meta[property="og:image"]'), ot = doc && doc.querySelector('meta[property="og:title"]');
-  var e = { title: (ot && ot.content) || c.title, rating: c.rating, ch: c.ch, chUrl: c.chUrl, img: '', site: hostOf(c.url) || location.hostname, t: Date.now(), feat: c.feat ? Date.now() : 0,
+  var e = { title: ogName(ot && ot.content) || c.title, rating: c.rating, ch: c.ch, chUrl: c.chUrl, img: '', site: hostOf(c.url) || location.hostname, t: Date.now(), feat: c.feat ? Date.now() : 0,
     g: [], desc: '', type: c.type || '', rel: [] };
   if (doc) {
     var seen = {}, rel = {};
@@ -1663,7 +1674,7 @@ function refreshRel() {
     if (mx != null && mx > (e.ch || 0) && mxU && (!jc || !e.chUrl || e.chUrl.indexOf(self + '/') === 0)) { e.ch = mx; e.chUrl = mxU; }
     if (!e.type) e.type = jsonType(document);
     var ot = document.querySelector('meta[property="og:title"]');
-    if (light && ot && ot.content) e.title = ot.content;
+    if (light && ot && ogName(ot.content)) e.title = ogName(ot.content);
     e.relSig = sig; e.ack = false; e.t = Date.now();
     put(DISC, keep(all, DISC_KEEP));
   }
