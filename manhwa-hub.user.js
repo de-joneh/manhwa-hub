@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.49.4
+// @version      3.49.5
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.49.4';
+var VERSION = '3.49.5';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -815,7 +815,9 @@ function fetchChapter(u) {
   var fin = function () { var w = e.w; e.w = []; w.forEach(function (f) { try { f(); } catch (er) {} }); };
   fetch(u, { credentials: 'include' }).then(function (r) { return r.ok ? r.text() : ''; }).then(function (html) {
     var doc = html ? new DOMParser().parseFromString(html, 'text/html') : null, imgs = html ? imgsFromHtml(html, doc) : [];
-    e.imgs = imgs; e.doc = doc; e.state = imgs.length >= 3 ? 'ok' : 'none';
+    // Gemerkt wird nur, was später gebraucht wird (Titel und Links fürs Weiter/Zurück), nicht die ganze Seite:
+    // bis zu 8 Kapitel × ganze Seite als DOM kostete am Handy viel Arbeitsspeicher
+    e.imgs = imgs; e.doc = slimDoc(doc); e.state = imgs.length >= 3 ? 'ok' : 'none';
     // Bilder dort vorladen, wo du weiterlesen würdest
     var a = ancFor(u, imgs), from = a ? Math.max(0, a.i - 1) : 0;
     if (e.state === 'ok' && prefs().preload && !prefs().save) imgs.slice(from, from + 4).forEach(function (src) { var im = new Image(); im.decoding = 'async'; im.src = src; });
@@ -824,6 +826,12 @@ function fetchChapter(u) {
   // Höchstens 8 Kapitel merken
   var ks = Object.keys(pre).filter(function (k) { return !pre[k].keep; }); if (ks.length > 8) ks.sort(function (a, b) { return pre[a].t - pre[b].t; }).slice(0, ks.length - 8).forEach(function (k) { if (k !== u) delete pre[k]; });
   return e;
+}
+function slimDoc(doc) {
+  if (!doc) return null;
+  var d = document.implementation.createHTMLDocument(doc.title || '');
+  doc.querySelectorAll('a[href]').forEach(function (a) { var n = d.createElement('a'); n.setAttribute('href', a.getAttribute('href')); n.textContent = (a.textContent || '').slice(0, 80); d.body.appendChild(n); });
+  return d;
 }
 // Wartet, bis ein Kapitel geholt ist (höchstens ms), dann cb(eintrag) oder cb(null)
 function whenReady(u, ms, cb) {
