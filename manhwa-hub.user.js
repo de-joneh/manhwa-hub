@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.49.0
+// @version      3.49.1
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.49.0';
+var VERSION = '3.49.1';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -1449,8 +1449,11 @@ function onlySeries(el, key, base) {
 var FEAT_SEL = '[class*="swiper"],[class*="slider"],[class*="carousel"],[class*="featured"],[class*="splide"],[class*="slick"],[class*="embla"],[class*="hero"],[class*="spotlight"]';
 // Titel aus einer Karte säubern: Art-Abzeichen vorne („manhwa …“), „Chapter 143 …“ hinten (auch angeklebt wie
 // „BraveChapter 12“) und eine Wertung am Ende („… 9.5“) gehören nicht zum Namen
+// Linktexte, die kein Name sind (Asura: „Read the Novel“ neben einer Serie, die es auch als Roman gibt)
+var GENERIC_T = /^(?:(?:read|start reading|continue reading|view|go to|open)(?: the)? (?:novel|manga|manhwa|manhua|comic|series|now|more|first|latest|chapter.*)|read more|show more|all chapters|details|more)$/i;
 function cleanCardTitle(t) {
   t = String(t || '').replace(/\s+/g, ' ').trim();
+  if (GENERIC_T.test(t)) return '';
   t = t.replace(/^(?:manhwa|manga|manhua|novel|webtoon|comic)\s+(?=\S)/i, '');
   t = t.replace(/\s*(?:chapter|chap|kapitel|episode|ch\.|ep\.)\s*\d[\d.,]*.*$/i, '');
   t = t.replace(/\s+\d{1,2}[.,]\d{1,2}$/, '');
@@ -1484,7 +1487,8 @@ function scrapeCards() {
     var img = card.tagName === 'IMG' ? card : card.querySelector('img'), title = '';
     // Ohne <img>: Cover als Hintergrundbild der Karte (manche Seiten)
     var bg = ''; if (!img && card.querySelectorAll) { var bgEl = [card].concat([].slice.call(card.querySelectorAll('[style*="background"],[data-bg],[data-background]'))).filter(function (x) { return bgUrl(x); })[0]; if (bgEl) bg = absUrl(bgUrl(bgEl)); }
-    var head = card.querySelector && card.querySelector('h1,h2,h3,h4,h5,[class*="title"],[class*="name"]');
+    // Erst echte Überschriften: ein Rahmen mit „title“ in der Klasse kann Wertung und Art mit enthalten (Vortex: „… 8“)
+    var head = card.querySelector && (card.querySelector('h1,h2,h3,h4,h5') || card.querySelector('[class*="title"],[class*="name"]'));
     var cands = [head ? spacedText(head) : ''];
     as.forEach(function (a) { cands.push(a.getAttribute('title') || ''); });
     cands.push(img ? img.alt || '' : '');
@@ -1989,6 +1993,18 @@ function scriptDescs(root, meta) {
 // Die Kurzbeschreibung in den Metadaten ist oft abgeschnitten. Gesucht wird das Element, das ihren Anfang enthält,
 // dann nach oben, solange der Behälter nur Absätze enthält (mehrere <p> einer Beschreibung). Dazu volle Fassungen aus
 // JSON-LD und den Seitendaten; genommen wird die längste, die zum Anfang passt.
+// Wie cleanDesc im Hub: vorn Titel/Namenslisten, hinten Zahlen und Beschriftungen weg (Asura: alles in einem Block)
+function descTrim(t) {
+  t = String(t || ''); if (!t) return t;
+  var ls = t.split('\n'), a = 0, b = ls.length;
+  var prose = function (l) { return l.length >= 60 || /[.!?…"“”»)\]]$/.test(l); };
+  var head = function (l) { return !l.trim() || (l.match(/ • /g) || []).length >= 2 || !prose(l.trim()); };
+  var tail = function (l) { return !l.trim() || (l.trim().length < 25 && !/[.!?…"“”»]$/.test(l.trim())); };
+  while (a < b && head(ls[a])) a++;
+  while (b > a && tail(ls[b - 1])) b--;
+  var out = ls.slice(a, b).join('\n').trim();
+  return out.length >= 40 ? out : t;
+}
 function fullDesc(root) {
   var meta = metaDesc(root);
   var probe = normT(meta.replace(/(\.\.\.|…)\s*$/, '')).slice(0, 60), best = null, bl = 1e9, bestCut = true;
@@ -2032,7 +2048,7 @@ function fullDesc(root) {
   // Längste gewinnt; gekürzte („…“) zählen etwas weniger
   var txt = '', sc = -1;
   cands.forEach(function (c) {
-    c = String(c || '').replace(/\s*(?:\.\.\.|…)?\s*(?:read|show|see|view)\s+(?:more|less|all)\s*$/i, '').trim();
+    c = descTrim(String(c || '')).replace(/\s*(?:\.\.\.|…)?\s*(?:read|show|see|view)\s+(?:more|less|all)\s*$/i, '').trim();
     var v = c.length - (cutEnd(c) ? 25 : 0);
     if (c && v > sc) { txt = c; sc = v; }
   });
