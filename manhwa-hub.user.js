@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.49.1
+// @version      3.49.2
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.49.1';
+var VERSION = '3.49.2';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -781,11 +781,14 @@ function imgsFromHtml(html, doc) {
     if ((aw > 0 && aw < 250) || (nw > 0 && nw < 250)) { var u = unproxy(imgSrc(im)); if (u) skip[u] = 1; }
   });
   var og = doc && doc.querySelector('meta[property="og:image"]'); if (og && og.content) skip[unproxy(og.content)] = 1;
-  var add = function (u) { u = unproxy(u); if (!u || seen[u] || skip[u] || readerSrcs[u] || hostOf(u) !== host) return; seen[u] = 1; out.push(u); };
+  // Gleiches Bild in anderer Größe („overgeared.905990-400.webp“ zum og:image „overgeared.905990.webp“): das Cover, keine Seite
+  var stem = function (u) { return String(u || '').split(/[?#]/)[0].split('/').pop().replace(/\.[a-z0-9]+$/i, '').replace(/[-_](?:\d{2,4}(?:x\d{2,4})?|thumb|small|medium|large)$/i, '').toLowerCase(); };
+  var ogStem = og && og.content ? stem(og.content) : '';
+  var add = function (u) { u = unproxy(u); if (!u || seen[u] || skip[u] || readerSrcs[u] || hostOf(u) !== host || (ogStem && stem(u) === ogStem)) return; seen[u] = 1; out.push(u); };
   if (doc) [].forEach.call(doc.images, function (im) { var w = +im.getAttribute('width'); if (!w || w >= 250) { var u = bestSrc(im); if (u) add(u); } });
   if (out.length < 3) {
     // Adressen im Seitentext, z. B. in den Daten von Next.js, mit maskierten Zeichen
-    var t = html.replace(/\\+u002[fF]/g, '/').replace(/\\+\//g, '/').replace(/\\+u0026/g, '&').replace(/&amp;/g, '&'), m;
+    var t = html.replace(/\\+u002[fF]/g, '/').replace(/\\+\//g, '/').replace(/\\+u0026/g, '&').replace(/&quot;|&#34;|&#x22;/gi, '"').replace(/&#39;|&#x27;/gi, "'").replace(/&amp;/g, '&'), m;
     var re = /(?:https?:)?\/\/[^"'\s<>()\\]+?\.(?:webp|jpe?g|png|avif|gif)(?:\?[^"'\s<>\\]*)?/gi;
     while ((m = re.exec(t))) add(m[0].indexOf('//') === 0 ? location.protocol + m[0] : m[0]);
   }
@@ -1592,6 +1595,7 @@ function parseDate(txt) {
   else if ((m = low.match(/\bvor\s+(\d+|eine[rmn]?)\s+([a-zä]+)/)) && unitMs(m[2])) t = now - num(m[1]) * unitMs(m[2]);
   else if (/\b(today|just now|heute|gerade eben)\b/.test(low)) t = now;
   else if (/\b(yesterday|gestern)\b/.test(low)) t = now - 864e5;
+  else if ((m = low.match(/\b(?:last|letzte[nrs]?)\s+([a-z]+)\b/)) && unitMs(m[1])) t = now - unitMs(m[1]);
   else if ((m = txt.match(/(\d{1,2})\.(\d{1,2})\.(\d{4})/))) t = new Date(+m[3], +m[2] - 1, +m[1]).getTime();
   else if ((m = txt.match(/(\d{4})-(\d{2})-(\d{2})/))) t = new Date(+m[1], +m[2] - 1, +m[3]).getTime();
   else if ((m = low.match(/([a-zä]{3,9})\.? (\d{1,2})(?:st|nd|rd|th)?,? (\d{4})/)) && (mi = MON[m[1].slice(0, 3)]) != null) t = new Date(+m[3], mi, +m[2]).getTime();
@@ -2124,7 +2128,8 @@ function altNames(root) {
   // Getrennt mit • ; | / oder Zeilen; bei einer Beschriftung ohne diese Zeichen auch mit Komma („A, B, C“)
   var all = raw.join('\n'), sep = comma && !/[•·;|\n]|\s\/\s/.test(all) ? /\s*,\s+/ : /\s*[•·;|\n]\s*|\s+\/\s+/;
   all.split(sep).forEach(function (x) {
-    x = x.replace(/\s+/g, ' ').trim(); var k = normT(x);
+    // Asura setzt ein Abzeichen „RANK #2“ in dieselbe Zeile wie den ersten Namen
+    x = x.replace(/\s+/g, ' ').trim().replace(/^(?:rank|top)\s*#?\s*\d+\s+|^#\d+\s+/i, ''); var k = normT(x);
     if (x.length < 2 || x.length > 150 || !k || k === title || seen[k]) return;
     seen[k] = 1; out.push(x);
   });
