@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.49.5
+// @version      3.50.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var isHub = !!document.querySelector('[data-mhub]');
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.49.5';
+var VERSION = '3.50.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -56,6 +56,46 @@ function imgStem(u) { return String(u || '').split(/[?#]/)[0].split('/').pop().r
 // Titel aus og:title ohne Seitennamen („Overgeared | Asura Scans“, „X – Read Online“)
 function ogName(t) { return String(t || '').split(/\s+[|–—]\s+|\s+-\s+(?=read\b|online\b|[^-]*\bscans?\b)/i)[0].replace(/\s+/g, ' ').trim(); }
 function coverStem(doc) { var og = (doc || document).querySelector('meta[property="og:image"]'); return og && og.content ? imgStem(og.content) : ''; }
+/* Bilder eines Kapitels aus einer abgerufenen Seite (Lesen im Hub, MHUB-READ). Ohne offene Seite zum Vergleich: alle
+   Bildadressen sammeln (<img> samt Lazy-Attributen und srcset, dann Adressen im Seitentext wie bei Next.js), nach Server +
+   Ordner gruppieren (Zahlen gleichgesetzt: manche Seiten legen jede Seite in einen eigenen Nummern-Ordner) und die größte
+   Gruppe nehmen, in der Reihenfolge der Seite; ein Ordner mit „chapter“ oder der Kapitelnummer zählt mehr. Cover
+   (og:image), Logos und kleine Bilder fallen weg, dieselbe Datei mit anderem ?v= nur einmal. */
+function chapterImgList(html, doc, base) {
+  var abs = function (u) {
+    try { u = new URL(String(u || '').trim(), base).href; } catch (e) { return ''; }
+    try { var x = new URL(u); if (/\/_next\/image/.test(x.pathname) && x.searchParams.get('url')) u = new URL(x.searchParams.get('url'), base).href; } catch (e) {}
+    return /^https?:\/\//.test(u) ? u : '';
+  };
+  var og = doc && doc.querySelector('meta[property="og:image"]'), ogStem = og && og.content ? imgStem(og.content) : '';
+  var cm = String(base || '').toLowerCase().match(CHNUM), cn = cm ? cm[1].replace(/[-_]/g, '.') : '';
+  var seen = {}, groups = {}, order = [];
+  var add = function (raw) {
+    var u = abs(raw); if (!u) return;
+    var path = u.replace(/^https?:\/\//, '').split(/[?#]/)[0], file = path.split('/').pop();
+    if (seen[path]) return; seen[path] = 1;
+    if (/logo|avatar|favicon|icon|emoji|banner|discord/i.test(file) || (ogStem && imgStem(u) === ogStem)) return;
+    var dir = path.slice(0, path.length - file.length), k = dir.replace(/\d+/g, '#');
+    if (!groups[k]) { groups[k] = { u: [], w: /chapter|chap|episode|\/ch[-_]?\d/i.test(dir) || (cn && dir.indexOf('/' + cn + '/') >= 0) ? 1.5 : 1 }; order.push(k); }
+    groups[k].u.push(u);
+  };
+  if (doc) [].forEach.call(doc.querySelectorAll('img'), function (im) {
+    var w = +im.getAttribute('width'); if (w && w < 250) return;
+    var set = im.getAttribute('srcset') || im.getAttribute('data-srcset') || '', fromSet = set ? pickSet(set) : '';
+    var ds = im.getAttribute('data-src') || im.getAttribute('data-lazy-src') || im.getAttribute('data-original') || im.getAttribute('data-url') || '';
+    var s = im.getAttribute('src') || '';
+    if (ds && (!s || /^data:|blank|placeholder|loading|lazy/i.test(s))) s = ds;
+    add(fromSet && !/^data:/.test(fromSet) ? fromSet : s);
+  });
+  if (html) {
+    var t = String(html).replace(/\\+u002[fF]/g, '/').replace(/\\+\//g, '/').replace(/\\+u0026/g, '&').replace(/&quot;|&#34;|&#x22;/gi, '"').replace(/&#39;|&#x27;/gi, "'").replace(/&amp;/g, '&'), m;
+    var re = /(?:https?:)?\/\/[^"'\s<>()\\]+?\.(?:webp|jpe?g|png|avif|gif)(?:\?[^"'\s<>\\]*)?/gi;
+    while ((m = re.exec(t))) add(m[0].indexOf('//') === 0 ? 'https:' + m[0] : m[0]);
+  }
+  var best = null;
+  order.forEach(function (k) { var g = groups[k]; if (!best || g.u.length * g.w > best.u.length * best.w) best = g; });
+  return best ? best.u.slice(0, 400) : [];
+}
 // Datensparmodus aus den Lese-Einstellungen (ohne prefs() aus 04-pc, das im Hub-Teil nicht läuft)
 function saveMode() { try { return (JSON.parse(GM_getValue('mhub_prefs', '{}')) || {}).save === true; } catch (e) { return false; } }
 /* Warteschlange zum Entdecken (Seiten, die noch abgerufen werden müssen), im Tampermonkey-Speicher: überlebt das
@@ -286,6 +326,41 @@ if (isHub || topMode) {
       });
     })();
   };
+  /* Lesen im Hub (ab 3.50): Kapitelseite holen und die Bildadressen schicken (MHUB-READ → MHUB-READOK). Nur Seiten der
+     bekannten Scan-Seiten. Bilder, die der Hub nicht direkt laden darf, holt das Skript mit der Kapitelseite als Referer
+     (MHUB-IMGDATA → MHUB-IMGDATAOK als data-URL), aber nur Bilder, die vorher eine Kapitelseite geliefert hat. */
+  var readImgs = {}, readN = 0;
+  var siteOk = function (u) {
+    var h = hostOf(u), w = SITES.slice();
+    try { w = w.concat(JSON.parse(GM_getValue('mhub_sites', '[]')) || []); } catch (e) {}
+    return /^https?:\/\//.test(u) && !!h && w.some(function (x) { return x && h.indexOf(String(x).toLowerCase()) >= 0; });
+  };
+  var readChapter = function (o) {
+    if (!o || typeof o.url !== 'string') return;
+    var fin = function (imgs, title) { post('MHUB-READOK:' + JSON.stringify({ id: o.id, url: o.url, imgs: imgs, title: title || '' })); };
+    if (!siteOk(o.url)) return fin([]);
+    fetchText(o.url, function (t) {
+      if (!t) return fin([]);
+      var doc = null; try { doc = new DOMParser().parseFromString(t, 'text/html'); } catch (e) {}
+      var imgs = chapterImgList(t, doc, o.url);
+      if (readN > 4000) { readImgs = {}; readN = 0; }
+      imgs.forEach(function (u) { if (!readImgs[u]) readN++; readImgs[u] = o.url; });
+      fin(imgs, doc ? doc.title : '');
+    });
+  };
+  var imgData = function (o) {
+    var ref = o && readImgs[o.url];
+    var fin = function (data) { post('MHUB-IMGDATAOK:' + JSON.stringify({ id: o.id, i: o.i, data: data || '' })); };
+    if (!ref) return fin('');
+    GM_xmlhttpRequest({ method: 'GET', url: o.url, responseType: 'blob', timeout: 30000, headers: { Referer: ref },
+      onload: function (r) {
+        var b = r.response;
+        if (r.status !== 200 || !b || !b.size || b.size > 15e6) return fin('');
+        if (!/^image\//.test(b.type || '')) { var ext = (o.url.split(/[?#]/)[0].match(/\.(webp|png|gif|avif)$/i) || [0, 'jpeg'])[1].toLowerCase(); b = new Blob([b], { type: 'image/' + ext }); }
+        var fr = new FileReader(); fr.onload = function () { fin(String(fr.result || '')); }; fr.onerror = function () { fin(''); }; fr.readAsDataURL(b);
+      },
+      onerror: function () { fin(''); }, ontimeout: function () { fin(''); } });
+  };
   window.addEventListener('message', function (e) {
     if (typeof e.data !== 'string' || e.data.indexOf('MHUB') !== 0) return;
     if (isHub ? e.origin !== location.origin : (!e.source || e.source === window)) return;
@@ -322,6 +397,8 @@ if (isHub || topMode) {
     else if (d.indexOf('MHUB-COVERS:') === 0) { try { runCovers(JSON.parse(d.slice(12))); } catch (err) {} }
     else if (d.indexOf('MHUB-DESC:') === 0) { try { runDescs(JSON.parse(d.slice(10))); } catch (err) {} }
     else if (d.indexOf('MHUB-FIND:') === 0) { try { runFind(JSON.parse(d.slice(10))); } catch (err) {} }
+    else if (d.indexOf('MHUB-READ:') === 0) { try { readChapter(JSON.parse(d.slice(10))); } catch (err) {} }
+    else if (d.indexOf('MHUB-IMGDATA:') === 0) { try { imgData(JSON.parse(d.slice(13))); } catch (err) {} }
     else if (d.indexOf('MHUB-IMG:') === 0) {
       try { var o = JSON.parse(d.slice(9)); shrink(o.url, function (img) { post('MHUB-IMGOK:' + JSON.stringify({ id: o.id, img: img })); }); } catch (err) {}
     }
