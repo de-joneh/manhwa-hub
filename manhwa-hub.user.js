@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.50.0
+// @version      3.50.1
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -18,12 +18,12 @@
 // @run-at       document-idle
 // ==/UserScript==
 (function (GM) {
-var isHub = !!document.querySelector('[data-mhub]');
+var hubMark = !!document.querySelector('[data-mhub]'), isHub = false;
 'use strict';
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.50.0';
+var VERSION = '3.50.1';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -140,9 +140,36 @@ function keep(o, n) {
 }
 // Der Hub läuft in einem eingebetteten Rahmen. Läuft das Skript dort nicht, übernimmt es die Claude-Seite
 // außen herum und spricht den Rahmen per Nachricht an.
+/* Wer ist der Hub? Nur echte Hubs bekommen die Schnittstelle (Lesestände, Abrufe fremder Seiten mit GM_xmlhttpRequest).
+   Bis 3.50 reichte data-mhub auf irgendeiner Seite: jede Webseite hätte sich als Hub ausgeben, deine Lesestände lesen und
+   über das Skript andere Seiten mit deinen Cookies abrufen können. Jetzt vertraut: der Hub als Claude-Artefakt
+   (claudeusercontent.com), lokale Dateien und Adressen, die du einmal bestätigt hast (mhub_hubs). */
+var HUB_ID = HUB_DEFAULT.split('/').pop();
+function hubList() { try { var a = JSON.parse(GM_getValue('mhub_hubs', '[]')); return Array.isArray(a) ? a : []; } catch (e) { return []; } }
+function hubAsk(where) {
+  var list = hubList(); if (list.indexOf(where) >= 0) return true;
+  try { if (sessionStorage.getItem('mhub_no') === where) return false; } catch (e) {}
+  var ok = false;
+  try { ok = window.confirm(L('Manhwa Hub: Diese Seite mit dem Userscript verbinden?\n\n', 'Manhwa Hub: connect this page to the userscript?\n\n') + where + '\n\n' +
+    L('Nur bestätigen, wenn das dein eigener Hub ist. Die Seite bekommt dann deine Lesestände und darf über das Skript Scan-Seiten abrufen.',
+      'Only confirm if this is your own hub. The page then gets your reading progress and may fetch scan sites through the script.')); } catch (e) {}
+  if (ok) { list.push(where); GM_setValue('mhub_hubs', JSON.stringify(list.slice(-10))); }
+  else { try { sessionStorage.setItem('mhub_no', where); } catch (e) {} }
+  return ok;
+}
+function hubTrusted() {
+  if (!hubMark) return false;
+  if (location.protocol === 'file:' || /(^|\.)claudeusercontent\.com$/.test(location.hostname)) return true;
+  if (location.protocol !== 'https:' && !/^(localhost|127\.0\.0\.1)$/.test(location.hostname)) return false;
+  if (window.top !== window.self) return hubList().indexOf(location.origin) >= 0;
+  return hubAsk(location.origin);
+}
+isHub = hubTrusted();
 var topMode = !isHub && window.top === window.self && /(^|\.)claude\.ai$/.test(location.hostname);
-var hubWin = isHub ? window : null;
-function post(m) { if (hubWin) { try { hubWin.postMessage(m, '*'); } catch (e) {} } }
+// Auf claude.ai nur die Seite des Hub-Artefakts (oder eine bestätigte), und nur Nachrichten aus Claude-Artefakten
+function topTrusted() { return location.pathname.indexOf(HUB_ID) >= 0 || hubAsk(location.origin + location.pathname); }
+var hubWin = isHub ? window : null, hubOrigin = isHub ? (location.origin && location.origin !== 'null' ? location.origin : '*') : '';
+function post(m) { if (hubWin) { try { hubWin.postMessage(m, hubOrigin || '*'); } catch (e) {} } }
 function token(forClipboard) {
   var l = get(LOG), cv = get(COV);
   // Stand von Serien, die noch nicht im Hub sind, erst nach deinem OK (Abfrage beim Lesen, askNew)
@@ -363,9 +390,12 @@ if (isHub || topMode) {
   };
   window.addEventListener('message', function (e) {
     if (typeof e.data !== 'string' || e.data.indexOf('MHUB') !== 0) return;
-    if (isHub ? e.origin !== location.origin : (!e.source || e.source === window)) return;
+    if (isHub ? e.origin !== location.origin : (!e.source || e.source === window || !/^https:\/\/[^\/]+\.claudeusercontent\.com$/.test(e.origin))) return;
     var d = e.data;
-    if (topMode && hubWin !== e.source) { hubWin = e.source; post('MHUB-CORE:' + VERSION); GM_setValue('mhub_home', location.origin + location.pathname); }
+    if (topMode && hubWin !== e.source) {
+      if (!topTrusted()) return;
+      hubWin = e.source; hubOrigin = e.origin; post('MHUB-CORE:' + VERSION); GM_setValue('mhub_home', location.origin + location.pathname);
+    }
     if (d === 'MHUB-HELLO') send();
     else if (d.indexOf('MHUB-LANG:') === 0) GM_setValue('mhub_lang', d.slice(10) === 'en' ? 'en' : 'de');
     else if (d.indexOf('MHUB-PREFS:') === 0) GM_setValue('mhub_prefs', d.slice(11));
