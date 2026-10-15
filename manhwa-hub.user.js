@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.50.1
+// @version      3.51.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var hubMark = !!document.querySelector('[data-mhub]'), isHub = false;
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.50.1';
+var VERSION = '3.51.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -95,6 +95,86 @@ function chapterImgList(html, doc, base) {
   var best = null;
   order.forEach(function (k) { var g = groups[k]; if (!best || g.u.length * g.w > best.u.length * best.w) best = g; });
   return best ? best.u.slice(0, 400) : [];
+}
+/* ---- Bezahlte Kapitel (Early Access, Coins, Premium) ----
+   Viele Seiten machen die neuesten Kapitel kostenpflichtig. Erkannt wird das an zwei Stellen:
+   1. In den Seitendaten pro Kapitel-Objekt: Asura (Astro) "is_premium", "early_access_until" (frei ab), Romane
+      "is_locked"; Vortex (seroval) isLocked/isAccessible/price/becameFreeAt; dazu isPaid/is_paid und ähnliche.
+   2. Im Kapitel-Link bzw. seiner Zeile: Klassen wie paid-…, …-lock, fa-coins, premium, ein Schloss/Münz-Bild oder Text
+      „Premium“/„🔒“/„100 Coins“ (Thunder zeigt nur ein Münz-Symbol). Gilt nur, wenn die Seitendaten nichts sagen.
+   Ergebnis: {Kapitelnummer: frei ab (ms) oder 0 = unbekannt}. */
+var LOCK_TOK = /(^|[-_])(paid|locked?|premium|vip|coins?|crown|early-?access)([-_]|$)/i, LOCK_NOT = /unlock|free|open|unpaid/i;
+function lockOfLink(a) {
+  var row = a;
+  for (var i = 0; i < 2 && row.parentElement && row.parentElement.querySelectorAll('a[href]').length === 1; i++) row = row.parentElement;
+  var els = [a, row].concat([].slice.call(row.querySelectorAll('*'), 0, 80));
+  for (var j = 0; j < els.length; j++) {
+    var el = els[j], cls = String((el.getAttribute && el.getAttribute('class')) || '');
+    if (cls && cls.split(/\s+/).some(function (t) { return LOCK_TOK.test(t) && !LOCK_NOT.test(t); })) return true;
+    if (el.tagName === 'IMG' && /lock|coin|premium/i.test((el.getAttribute('alt') || '') + ' ' + String(el.getAttribute('src') || '').split(/[?#]/)[0].split('/').pop())) return true;
+  }
+  var tx = (row.textContent || '').replace(/\s+/g, ' ');
+  return tx.length < 300 && /🔒|🪙|\bpremium\b|\bearly access\b|\b\d+\s*coins?\b/i.test(tx);
+}
+function lockJson(root, base) {
+  var lock = {}, free = {}, now = Date.now(), texts = pageTexts(root).slice();
+  [].forEach.call(root.querySelectorAll('astro-island[props]'), function (x) { texts.push(x.getAttribute('props') || ''); });
+  var BOOL = function (k) { return new RegExp('["\']?(?:' + k + ')["\']?\\s*:\\s*(?:\\[0,\\s*)?(true|false|!0|!1)', 'i'); };
+  var DATE = function (k) { return new RegExp('["\']?(?:' + k + ')["\']?\\s*:\\s*(?:\\[0,\\s*)?"([^"]{8,40})"', 'i'); };
+  var RP = BOOL('is_?premium|premium'), RL = BOOL('is_?locked|locked'), RA = BOOL('is_?accessible'), RPD = BOOL('is_?paid'), RE = DATE('early_?access_?until'), RF = DATE('became_?free_?at');
+  var NUM = /["']?(?:number|chapter_?number|chapter_?no|chapterNum)["']?\s*:\s*(?:\[0,\s*)?"?(\d{1,5}(?:\.\d+)?)/i;
+  var KEY = /["']?(?:is_?premium|is_?locked|is_?paid|is_?accessible|early_?access_?until|locked|premium)["']?\s*:/gi;
+  // Zu welcher Serie gehört ein Kapitel-Objekt? Die letzte Serien-Kennung („slug“, kein Kapitel-Slug) davor. Auf Seiten mit
+  // vielen Serien (Startseite, Empfehlungen) sonst falsche Zuordnung bei gleicher Kapitelnummer
+  var SLUG = /["']?slug["']?\s*:\s*(?:\[0,\s*)?"([^"]{2,200})"/gi, flat = function (x) { return String(x).toLowerCase().replace(/[^a-z0-9]+/g, ''); }, fb = flat(base || '');
+  var other = function (t, at) {
+    if (!fb) return false;
+    var from = Math.max(0, at - 30000), part = t.slice(from, at), m2, last = '';
+    SLUG.lastIndex = 0; while ((m2 = SLUG.exec(part))) if (!/^(chapter|chap|ch|episode|ep)[-_.]?\d/i.test(m2[1])) last = m2[1];
+    if (!last) return false;
+    var fl = flat(last.split('/').pop()); return fl.length >= 3 && fl.indexOf(fb) < 0 && fb.indexOf(fl) < 0;
+  };
+  texts.forEach(function (t) {
+    if (!/premium|locked|paid|accessible|early_?access/i.test(t)) return;
+    var m, n = 0, seen = {};
+    KEY.lastIndex = 0;
+    while ((m = KEY.exec(t)) && n++ < 4000) {
+      var a = t.lastIndexOf('{', m.index), z = t.indexOf('}', m.index);
+      if (a < 0 || z < 0 || seen[a] || m.index - a > 1500 || z - m.index > 1500) continue;
+      seen[a] = 1;
+      var o = t.slice(a, z + 1); if (o.indexOf('{', 1) > -1) continue;
+      var nu = o.match(NUM); if (!nu || other(t, a)) continue;
+      var k = String(parseFloat(nu[1])), g = function (re) { var x = o.match(re); return x ? x[1] : null; };
+      var yes = function (x) { return x === 'true' || x === '!0'; }, no = function (x) { return x === 'false' || x === '!1'; };
+      var pr = g(RP), lk = g(RL), ac = g(RA), pd = g(RPD), ea = g(RE), fa = g(RF);
+      var until = ea ? Date.parse(ea) : NaN, freeAt = fa ? Date.parse(fa) : NaN;
+      if (!(until > now)) until = 0;
+      var locked = !!until || yes(pr) || yes(lk) || no(ac) || (yes(pd) && !(freeAt <= now));
+      if (locked && !until && freeAt > now) until = freeAt;
+      if (locked) lock[k] = Math.max(lock[k] || 0, until);
+      else if (pr || lk || ac || pd || ea) free[k] = 1;
+    }
+  });
+  return { lock: lock, free: free };
+}
+// Gesperrte Kapitel einer Serie auf einer Seite (root = Dokument, page = Adresse, mine(u) = gehört der Link zur Serie?)
+function lockedChapters(root, page, mine, base) {
+  var nums = {}, dom = {}, total = 0, out = {};
+  [].forEach.call(root.querySelectorAll('a[href]'), function (a) {
+    var u = ''; try { u = new URL(a.getAttribute('href'), page).href.replace(/[#?].*$/, ''); } catch (e) { return; }
+    var m = u.replace(/^https?:\/\/[^\/]+/, '').toLowerCase().match(CHNUM); if (!m || !mine(u)) return;
+    var n = String(parseFloat(m[1].replace(/[-_]/, '.')));
+    if (!nums[n]) { nums[n] = 1; total++; }
+    if (lockOfLink(a)) dom[n] = 0;
+  });
+  var js = lockJson(root, base);
+  Object.keys(js.lock).forEach(function (n) { if (!total || nums[n]) out[n] = js.lock[n]; });
+  // Fast alles „gesperrt“ nur über Klassen/Symbole: eher ein Fehlalarm (Symbol in jeder Zeile), dann nicht
+  var dn = Object.keys(dom).filter(function (n) { return !(n in js.free) && !(n in out); });
+  if (!(total > 10 && dn.length > total * 0.6)) dn.forEach(function (n) { out[n] = 0; });
+  var ks = Object.keys(out).sort(function (a, b) { return b - a; }).slice(0, 60), r = {};
+  ks.forEach(function (k) { r[k] = out[k]; });
+  return r;
 }
 // Datensparmodus aus den Lese-Einstellungen (ohne prefs() aus 04-pc, das im Hub-Teil nicht läuft)
 function saveMode() { try { return (JSON.parse(GM_getValue('mhub_prefs', '{}')) || {}).save === true; } catch (e) { return false; } }
@@ -183,7 +263,7 @@ function token(forClipboard) {
   var c = Object.keys(cv).filter(function (k) { return !cv[k].ack && (!forClipboard || (cv[k].sent || 0) < 2); })
     .map(function (k) { return { url: k, img: cv[k].img, title: cv[k].title, q: cv[k].q || 0 }; });
   var dd = get(DISC), d = Object.keys(dd).filter(function (k) { return !dd[k].ack; }).slice(0, forClipboard ? 30 : 150)
-    .map(function (k) { var e = dd[k]; return { url: k, title: e.title, rating: e.rating, ch: e.ch, chUrl: e.chUrl, img: e.img, site: e.site, g: e.g, desc: e.desc, type: e.type, rel: e.rel, ss: e.ss || '', q: e.q || 0, feat: e.feat || 0, alt: e.alt || [], iu: e.iu || '' }; });
+    .map(function (k) { var e = dd[k]; return { url: k, title: e.title, rating: e.rating, ch: e.ch, chUrl: e.chUrl, img: e.img, site: e.site, g: e.g, desc: e.desc, type: e.type, rel: e.rel, ss: e.ss || '', q: e.q || 0, feat: e.feat || 0, alt: e.alt || [], iu: e.iu || '', lk: e.lk || null, lkp: e.lkp || 0, lkt: e.lkt || 0 }; });
   var a = forClipboard ? [] : Object.keys(get(ADD));
   var rr = get('mhub_rate'), r = Object.keys(rr).map(function (k) { return { k: k, r: rr[k].r, t: rr[k].t }; });
   if (!p.length && !c.length && !d.length && !a.length && !r.length) return '';
@@ -220,13 +300,21 @@ if (isHub || topMode) {
     }
     return best;
   };
+  // Bezahlte Kapitel auf einer abgerufenen Serienseite (nur wenn der Text überhaupt danach aussieht: spart das Zerlegen)
+  var lockOfPage = function (t, page) {
+    if (!/premium|locked|lock|coin|paid|accessible|early_?access/i.test(t)) return {};
+    var doc = null; try { doc = new DOMParser().parseFromString(t, 'text/html'); } catch (e) { return {}; }
+    var base = slugBase(page);
+    return lockedChapters(doc, page, function (u) { return pathOf(u).toLowerCase().indexOf(base) > -1 && sameKind(u, page); }, base);
+  };
   var checkOne = function (j, cb) {
-    var pt = pattern(j.tpl), urls = [seriesPage(j.tpl), j.latest].filter(Boolean), i = 0;
+    var sp = seriesPage(j.tpl), pt = pattern(j.tpl), urls = [sp, j.latest].filter(Boolean), i = 0;
     (function step() {
       if (i >= urls.length) return cb(null);
-      fetchText(urls[i++], function (t) {
+      var u = urls[i++];
+      fetchText(u, function (t) {
         var b = t ? scan(t, pt) : null;
-        if (b) return cb(b);
+        if (b) { if (u === sp) b.lk = lockOfPage(t, sp); return cb(b); }
         step();
       });
     })();
@@ -239,7 +327,7 @@ if (isHub || topMode) {
       if (i >= jobs.length) { checking = false; post('MHUB-CHECKEND:' + JSON.stringify({ total: jobs.length })); return; }
       var j = jobs[i++];
       checkOne(j, function (b) {
-        post('MHUB-FOUND:' + JSON.stringify({ id: j.id, max: b ? b.n : null, url: b ? b.url : null, done: i, total: jobs.length }));
+        post('MHUB-FOUND:' + JSON.stringify({ id: j.id, max: b ? b.n : null, url: b ? b.url : null, lk: b && b.lk ? b.lk : null, done: i, total: jobs.length }));
         setTimeout(next, 900);
       });
     })();
@@ -303,7 +391,7 @@ if (isHub || topMode) {
         if (!best) return step();
         fetchText(best.u, function (page) {
           var ch = page ? chaptersOf(page, best.u) : [];
-          cb(ch.length ? { page: best.u, title: best.name, ch: ch.slice(-3000) } : null);
+          cb(ch.length ? { page: best.u, title: best.name, ch: ch.slice(-3000), lk: lockOfPage(page, best.u) } : null);
         });
       });
     })();
@@ -348,7 +436,7 @@ if (isHub || topMode) {
       if (i >= o.sites.length) { post('MHUB-FINDEND:' + JSON.stringify({ id: o.id, found: found })); return; }
       var site = o.sites[i++];
       findOn(o.titles, site, function (r) {
-        if (r) { found++; post('MHUB-SRCFOUND:' + JSON.stringify({ id: o.id, host: site.host, page: r.page, title: r.title, ch: r.ch })); }
+        if (r) { found++; post('MHUB-SRCFOUND:' + JSON.stringify({ id: o.id, host: site.host, page: r.page, title: r.title, ch: r.ch, lk: r.lk || null })); }
         setTimeout(next, 700);
       });
     })();
@@ -697,7 +785,8 @@ function chapterTargets(root, pth) {
   var prevN = Math.ceil(n) - 1, nextN = Math.floor(n) + 1;
   var prev = found[prevN] || (prevN >= 1 ? make(prevN) : '');
   // Nicht auf dieser Seite verlinkt: Adresse aus dem Hub (kann eine andere Seite sein, die das Kapitel schon hat)
-  var next = found[nextN] || (e && e.x && e.x[String(nextN)]) || (e && e.m >= nextN ? make(nextN) : '');
+  // Kostet das nächste Kapitel hier, gibt es aber anderswo frei (f vom Hub): dorthin
+  var next = (e && e.f && e.f[String(nextN)]) || found[nextN] || (e && e.x && e.x[String(nextN)]) || (e && e.m >= nextN ? make(nextN) : '');
   var home = head.replace(/[-_\/]+$/, ''), homeUrl = isSeriesUrl(location.origin + home) ? location.origin + home : '';
   return { prev: prev, prevN: prevN, next: next, nextN: nextN, homeUrl: homeUrl, n: n, key: key, lib: e };
 }
@@ -1632,14 +1721,16 @@ function scrapeCards() {
     while ((m = re.exec(text))) { var v = parseFloat(m[1].replace(',', '.')); if (v > 0 && v <= 10) { rating = v; break; } }
     // Roman-Adresse geht vor: ein „Manhwa“-Abzeichen daneben gehört oft zu einer Empfehlung
     var type = isNovelUrl(k) ? 'Novel' : badgeType(card);
-    var chN = null, chU = null;
+    var chN = null, chU = null, chA = null;
     card.querySelectorAll('a[href]').forEach(function (a) {
       var u = absUrl(a.getAttribute('href')), n = chOf(u);
-      if (n != null && sameKind(u, k) && (chN == null || n > chN)) { chN = n; chU = u; }
+      if (n != null && sameKind(u, k) && (chN == null || n > chN)) { chN = n; chU = u; chA = a; }
     });
+    // Karte zeigt beim neuesten Kapitel ein Schloss/Münzen (Thunder): nur dieses Kapitel als bezahlt melden
+    var clk = null; if (chA && lockOfLink(chA)) { clk = {}; clk[String(chN)] = 0; }
     // Steht die Karte in einem Slider/Karussell (oben auf der Startseite der Scan-Seite), ist sie gerade hervorgehoben
     var feat = !!(card.closest && card.closest(FEAT_SEL));
-    out.push({ url: k, title: title.slice(0, 120), rating: rating, ch: chN, chUrl: chU, type: type, feat: feat,
+    out.push({ url: k, title: title.slice(0, 120), rating: rating, ch: chN, chUrl: chU, type: type, feat: feat, lk: clk,
       imgSrc: img ? fitSrc(img, feat ? 900 : 600) : bg, imgRaw: img ? (img.currentSrc || img.src || img.getAttribute('data-src') || '') : '' });
   });
   return out;
@@ -1691,7 +1782,10 @@ function fromDoc(c, doc, cb) {
     if (isNovelUrl(c.url)) e.type = 'Novel';
     e.ss = siteStatus(doc) || jsonStatus(doc);
     e.alt = altNames(doc);
+    // Bezahlte Kapitel (vollständige Sicht der Serienseite: ersetzt im Hub, was vorher bekannt war)
+    e.lk = lockedChapters(doc, c.url, function (u) { return pathOf(u).toLowerCase().indexOf(base) > -1 && sameKind(u, c.url); }, base); e.lkt = Date.now();
   }
+  else if (c.lk) { e.lk = c.lk; e.lkp = 1; e.lkt = Date.now(); }
   // 400 px breit: scharf in der Entdecken-Liste auch bei hoher Pixeldichte; hervorgehobene (fürs Karussell) 600 px.
   // Quelle in passender Größe (docCoverUrl), sonst das Bild der Karte
   // Klappt eine Adresse nicht (gesperrt, nicht da), die nächste: so fehlt kein Bild mehr
@@ -1781,8 +1875,9 @@ function refreshRel() {
   relDoneFor = path;
   var list = Object.keys(rel).map(function (n) { return [parseFloat(n), rel[n]]; }).sort(function (a, b) { return a[0] - b[0]; }).slice(-20);
   var desc = fullDesc(document), hg = headGenres(document), ss = siteStatus(document) || jsonStatus(document), alt = altNames(document);
+  var lk = lockedChapters(document, self, function (u) { return pathOf(u).toLowerCase().indexOf(base) > -1 && sameKind(u, self); }, base);
   if (!hg.length && !(e.g && e.g.length)) hg = jsonGenres(document);
-  var sig = JSON.stringify([list, mx, desc.length, hg, ss, alt]);
+  var sig = JSON.stringify([list, mx, desc.length, hg, ss, alt, lk]);
   var light = !e.desc && !(e.g && e.g.length), noImg = !e.q && !saveMode();
   if (e.relSig !== sig) {
     if (list.length) e.rel = list;
@@ -1790,6 +1885,7 @@ function refreshRel() {
     if (hg.length) e.g = mergeGenres(hg, e.g || []);
     if (ss) e.ss = ss;
     if (alt.length) e.alt = alt;
+    e.lk = lk; e.lkt = Date.now(); delete e.lkp;
     if (mx != null && mx > (e.ch || 0) && mxU && (!jc || !e.chUrl || e.chUrl.indexOf(self + '/') === 0)) { e.ch = mx; e.chUrl = mxU; }
     if (!e.type) e.type = jsonType(document);
     var ot = document.querySelector('meta[property="og:title"]');
@@ -1824,7 +1920,9 @@ function queueSelf(self) {
 // Ohne Abruf: was die Karte selbst zeigt. Für Serien, die der gemeinsame Pool schon vollständig kennt (mhub_known),
 // und im Datensparmodus (außer hervorgehobene). Bild und Beschreibung kommen dann aus dem Pool
 function lightEntry(c) {
-  return { title: c.title, rating: c.rating, ch: c.ch, chUrl: c.chUrl, img: '', site: hostOf(c.url) || location.hostname, t: Date.now(), feat: c.feat ? Date.now() : 0, g: [], desc: '', type: c.type || '', rel: [] };
+  var e = { title: c.title, rating: c.rating, ch: c.ch, chUrl: c.chUrl, img: '', site: hostOf(c.url) || location.hostname, t: Date.now(), feat: c.feat ? Date.now() : 0, g: [], desc: '', type: c.type || '', rel: [] };
+  if (c.lk) { e.lk = c.lk; e.lkp = 1; e.lkt = Date.now(); }
+  return e;
 }
 var knownRaw = '', knownSet = {};
 function isKnown(u) {
