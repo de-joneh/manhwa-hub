@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.52.0
+// @version      3.53.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var hubMark = !!document.querySelector('[data-mhub]'), isHub = false;
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.52.0';
+var VERSION = '3.53.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -69,15 +69,18 @@ function imgAttr(im) {
   var s = im.getAttribute('src') || '';
   return ds && (!s || /^data:|blank|placeholder|loading|lazy/i.test(s)) ? ds : s;
 }
-function chapterImgList(html, doc, base) {
-  var abs = function (u) {
-    try { u = new URL(String(u || '').trim(), base).href; } catch (e) { return ''; }
-    try { var x = new URL(u); if (/\/_next\/image/.test(x.pathname) && x.searchParams.get('url')) u = new URL(x.searchParams.get('url'), base).href; } catch (e) {}
-    return /^https?:\/\//.test(u) ? u : '';
-  };
+// Volle Bildadresse (auch hinter dem Next.js-Bildproxy), nur http(s)
+function imgAbs(u, base) {
+  try { u = new URL(String(u || '').trim(), base).href; } catch (e) { return ''; }
+  try { var x = new URL(u); if (/\/_next\/image/.test(x.pathname) && x.searchParams.get('url')) u = new URL(x.searchParams.get('url'), base).href; } catch (e) {}
+  return /^https?:\/\//.test(u) ? u : '';
+}
+// Seitenbilder eines Kapitels; generic: ohne Profil (zum Einlernen)
+function chapterImgList(html, doc, base, generic) {
+  var abs = function (u) { return imgAbs(u, base); };
   // Laut Profil stehen die Seitenbilder hier (mindestens zwei, sonst wie unten raten)
   var own = [];
-  if (doc) profEls(bindProfile(doc, base), 'pages.img').forEach(function (im) { var u = abs(imgAttr(im)); if (u && own.indexOf(u) < 0) own.push(u); });
+  if (doc && !generic) profEls(bindProfile(doc, base), 'pages.img').forEach(function (im) { var u = abs(imgAttr(im)); if (u && own.indexOf(u) < 0) own.push(u); });
   if (own.length >= 2) { profReport(doc, 'pages.img', true); return own.slice(0, 400); }
   var og = doc && doc.querySelector('meta[property="og:image"]'), ogStem = og && og.content ? imgStem(og.content) : '';
   var cm = String(base || '').toLowerCase().match(CHNUM), cn = cm ? cm[1].replace(/[-_]/g, '.') : '';
@@ -102,7 +105,7 @@ function chapterImgList(html, doc, base) {
   }
   var best = null;
   order.forEach(function (k) { var g = groups[k]; if (!best || g.u.length * g.w > best.u.length * best.w) best = g; });
-  if (doc) profReport(doc, 'pages.img', false, !!best && best.u.length >= 2);
+  if (doc && !generic) profReport(doc, 'pages.img', false, !!best && best.u.length >= 2);
   return best ? best.u.slice(0, 400) : [];
 }
 /* ---- Bezahlte Kapitel (Early Access, Coins, Premium) ----
@@ -273,10 +276,10 @@ function token(forClipboard) {
     .map(function (k) { var e = dd[k]; return { url: k, title: e.title, rating: e.rating, ch: e.ch, chUrl: e.chUrl, img: e.img, site: e.site, g: e.g, desc: e.desc, type: e.type, rel: e.rel, ss: e.ss || '', q: e.q || 0, feat: e.feat || 0, alt: e.alt || [], iu: e.iu || '', lk: e.lk || null, lkp: e.lkp || 0, lkt: e.lkt || 0 }; });
   var a = forClipboard ? [] : Object.keys(get(ADD));
   var rr = get('mhub_rate'), r = Object.keys(rr).map(function (k) { return { k: k, r: rr[k].r, t: rr[k].t }; });
-  if (!p.length && !c.length && !d.length && !a.length && !r.length) return '';
-  // Selbsttest der Seiten-Profile (klein; nur im Hub, nicht beim Kopieren)
-  var ph = forClipboard ? null : get(P_HEALTH);
-  return 'MHUB2:' + btoa(unescape(encodeURIComponent(JSON.stringify({ p: p, c: c, d: d, a: a, r: r, n: n, ph: ph }))));
+  // Eingelernte Profile, die der Hub noch nicht hat; Selbsttest der Profile (beides nur im Hub, nicht beim Kopieren)
+  var lp = forClipboard ? [] : gmList(P_MINE), ph = forClipboard ? null : get(P_HEALTH);
+  if (!p.length && !c.length && !d.length && !a.length && !r.length && !lp.length) return '';
+  return 'MHUB2:' + btoa(unescape(encodeURIComponent(JSON.stringify({ p: p, c: c, d: d, a: a, r: r, n: n, ph: ph, lp: lp }))));
 }
 
 /* ---------- Seiten-Profile ----------
@@ -287,24 +290,41 @@ function token(forClipboard) {
      chapters.link/date/lock               Kapitel-Links, Datum in der Zeile, Kennzeichen für bezahlte Kapitel
      pages.img                             Seitenbilder im Kapitel
    Jede Angabe ist freiwillig. Was ein Profil nicht sagt oder was dort nichts findet, übernimmt die allgemeine Erkennung
-   wie bisher. Quelle: src/profiles/*.json. Das Skript bringt sie mit; der Hub schickt seine (MHUB-PROFILES), eine höhere
-   Version gewinnt – so lassen sich geänderte Seiten ohne Skript-Update nachziehen. Ob die Profile noch passen, merkt sich
-   das Skript (mhub_phealth) und meldet es mit dem Lesestand an den Hub. Abgeschaltete Seiten: mhub_siteoff. */
+   wie bisher. Quellen: src/profiles/*.json (bringt das Skript mit), die Liste vom Hub (MHUB-PROFILES: dieselben Dateien,
+   evtl. neuer, und eingelernte) und hier eingelernte, die der Hub noch nicht bestätigt hat (mhub_learned, 13-einlernen).
+   Pro Seite gilt das neueste (geprüft- bzw. eingelernt-Datum, dann Version): so lassen sich umgebaute Seiten ohne
+   Skript-Update nachziehen, und ein neueres mitgeliefertes Profil löst ein älteres eingelerntes ab. Ob die Profile noch
+   passen, merkt sich das Skript (mhub_phealth) und meldet es mit dem Lesestand an den Hub. Abgeschaltet: mhub_siteoff. */
 var PROFILES = [{"id":"asura","name":"Asura Scans","v":1,"checked":"2026-10-12","match":["asura"],"search":"/browse?search={q}","series":{"title":"article h1","desc":"#description-text","alt":"#alt-titles","genres":"a[href*='/browse?genres=']"},"chapters":{"link":"a[href*='/chapter/']"}},{"id":"thunder","name":"Thunder Scans","v":1,"checked":"2026-10-12","match":["thunder"],"search":"/?s={q}","series":{"title":"h1.entry-title","desc":".entry-content[itemprop='description']","alt":".alternative, .seriestualt","genres":".mgen a, .seriestugenre a","status":".imptdt"},"chapters":{"link":"#chapterlist li a, .eplister li a","date":".chapterdate","lock":".fa-coins, .fa-lock"},"pages":{"img":"#readerarea img"}},{"id":"vortex","name":"Vortex Scans","v":1,"checked":"2026-10-12","match":["vortex"],"search":"/series/?searchTerm={q}","chapters":{"lock":".paid-chapter-row"}}];
-var P_LIST = 'mhub_profiles', P_OFF = 'mhub_siteoff', P_HEALTH = 'mhub_phealth';
+var P_LIST = 'mhub_profiles', P_MINE = 'mhub_learned', P_OFF = 'mhub_siteoff', P_HEALTH = 'mhub_phealth';
 var pMerged = null, pMergedRaw = null, pDocs = new WeakMap();
+// Liste aus dem GM-Speicher (Kaputtes = leer); gmWords nur Texte
+function gmList(k) { try { var a = JSON.parse(GM_getValue(k, '[]')); return Array.isArray(a) ? a : []; } catch (e) { return []; } }
+function gmWords(k) { return gmList(k).filter(function (x) { return typeof x === 'string' && x; }); }
+// Gleiche Regel im Hub (newerProfile in 21): neueres Datum gewinnt, bei gleichem die höhere Version
+function pStamp(p) { return Math.max(+p.learned || 0, Date.parse(p.checked) || 0); }
+function pNewer(a, b) { return pStamp(a) !== pStamp(b) ? pStamp(a) > pStamp(b) : (+a.v || 0) > (+b.v || 0); }
 function profiles() {
-  var raw = GM_getValue(P_LIST, '');
+  var raw = GM_getValue(P_LIST, '') + '|' + GM_getValue(P_MINE, '');
   if (pMerged && raw === pMergedRaw) return pMerged;
   var byId = {};
-  PROFILES.forEach(function (p) { byId[p.id] = p; });
-  try {
-    (JSON.parse(raw || '[]') || []).forEach(function (p) {
-      if (p && typeof p.id === 'string' && /^[a-z0-9-]{1,40}$/.test(p.id) && Array.isArray(p.match) && (!byId[p.id] || (+p.v || 0) > (+byId[p.id].v || 0))) byId[p.id] = p;
-    });
-  } catch (e) {}
+  PROFILES.concat(gmList(P_LIST), gmList(P_MINE)).forEach(function (p) {
+    if (p && typeof p.id === 'string' && /^[a-z0-9-]{1,40}$/.test(p.id) && Array.isArray(p.match) && (!byId[p.id] || pNewer(p, byId[p.id]))) byId[p.id] = p;
+  });
   pMergedRaw = raw; pMerged = Object.keys(byId).map(function (k) { return byId[k]; });
   return pMerged;
+}
+// Vom Hub (MHUB-PROFILES): seine Liste und die abgeschalteten Seiten; was er von hier Eingelerntes schon hat, ist erledigt
+function profilesFromHub(po) {
+  if (!po || typeof po !== 'object') return;
+  if (Array.isArray(po.list)) {
+    GM_setValue(P_LIST, JSON.stringify(po.list));
+    var mine = gmList(P_MINE), left = mine.filter(function (m) {
+      return !po.list.some(function (p) { return p && m && p.id === m.id && (+p.learned || 0) >= (+m.learned || 0); });
+    });
+    if (left.length !== mine.length) GM_setValue(P_MINE, JSON.stringify(left));
+  }
+  if (Array.isArray(po.off)) GM_setValue(P_OFF, JSON.stringify(po.off));
 }
 function matchWord(host, w) { return !!w && host.indexOf(String(w).toLowerCase()) > -1; }
 function profileFor(url) {
@@ -346,8 +366,6 @@ function profReport(root, key, byProfile, byGeneral) {
   if (byProfile) c.ok = now; else c.bad = now;
   c.n = n; c.v = +p.v || 0; h[key] = c; put(P_HEALTH, all);
 }
-// Liste aus dem GM-Speicher (nur Texte; Kaputtes = leer)
-function gmWords(k) { try { var a = JSON.parse(GM_getValue(k, '[]')); return Array.isArray(a) ? a.filter(function (x) { return typeof x === 'string' && x; }) : []; } catch (e) { return []; } }
 // Abgeschaltet (Einstellungen im Hub): Adresse enthält ein abgeschaltetes Wort
 function siteOff(url) { var h = hostOf(url).toLowerCase(); return !h || gmWords(P_OFF).some(function (w) { return matchWord(h, w); }); }
 // Aktive Wörter der Scan-Seiten: mitgebrachte, die der Profile und vom Hub, ohne abgeschaltete
@@ -359,18 +377,19 @@ function siteWords() {
 function siteActive(url) { var h = hostOf(url).toLowerCase(); return !siteOff(url) && siteWords().some(function (w) { return matchWord(h, w); }); }
 /* Kapitel-Links einer Serie auf einer Seite: [{a, n, u}] – Nummer aus der Adresse, nur dieselbe Seite, dieselbe Serie
    (Name in der Adresse) und dieselbe Art (Roman/Comic). Mit Profil zuerst dessen Kapitel-Links; finden die nichts, alle
-   Links der Seite. Eine Stelle für Serienseite, Funde, Kapitelsuche, Bezahlt-Erkennung und die Karte auf der Serienseite. */
-function seriesChapters(root, page) {
+   Links der Seite. Eine Stelle für Serienseite, Funde, Kapitelsuche, Bezahlt-Erkennung und die Karte auf der Serienseite.
+   generic: ohne Profil (zum Einlernen). */
+function seriesChapters(root, page, generic) {
   var base = slugBase(page), host = hostOf(page), out = [];
   var take = function (a) {
     var u = absUrl(a.getAttribute('href'), page), n = chOf(u);
-    if (n == null || hostOf(u) !== host || pathOf(u).toLowerCase().indexOf(base) < 0 || !sameKind(u, page)) return;
+    if (n == null || hostOf(u) !== host || !slugIn(u, base) || !sameKind(u, page)) return;
     out.push({ a: a, n: n, u: u });
   };
-  profEls(root, 'chapters.link').forEach(take);
+  if (!generic) profEls(root, 'chapters.link').forEach(take);
   var byProfile = out.length > 0;
   if (!byProfile) [].forEach.call(root.querySelectorAll('a[href]'), take);
-  profReport(root, 'chapters.link', byProfile, out.length > 0);
+  if (!generic) profReport(root, 'chapters.link', byProfile, out.length > 0);
   return out;
 }
 // Zeile eines Kapitel-Links: der Link selbst oder sein Rahmen, solange darin nur dieser eine Link steckt (höchstens 2 Stufen)
@@ -486,7 +505,7 @@ if (isHub || topMode) {
     // Seiten, die die Liste erst im Browser zeichnen: Kapitel-Adressen im Seitentext (Next.js-Daten)
     var t = html.replace(/\\+\//g, '/'), re = /(?:https?:\/\/[^"'\s<>\\]+)?\/[^"'\s<>\\]*(?:chapter|chap|ch|episode|ep)[-_\/ .]?\d+(?:[-_.]\d+)?\/?/gi, m;
     while ((m = re.exec(t))) {
-      var u = absU(m[0], page), n = u && hostOfU(u) === host && pathOf(u).toLowerCase().indexOf(base) > -1 && sameKind(u, page) ? chOf(u) : null;
+      var u = absU(m[0], page), n = u && hostOfU(u) === host && slugIn(u, base) && sameKind(u, page) ? chOf(u) : null;
       if (n != null && n < 100000 && !found[n]) found[n] = u;
     }
     return Object.keys(found).map(function (n) { return [+n, found[n]]; }).sort(function (a, b) { return a[0] - b[0]; });
@@ -605,7 +624,7 @@ if (isHub || topMode) {
     else if (d.indexOf('MHUB-PREFS:') === 0) GM_setValue('mhub_prefs', d.slice(11));
     else if (d === 'MHUB-RELOAD' && topMode) location.reload();
     else if (d.indexOf('MHUB-PROFILES:') === 0) {
-      try { var po = JSON.parse(d.slice(14)); if (Array.isArray(po.list)) GM_setValue(P_LIST, JSON.stringify(po.list)); if (Array.isArray(po.off)) GM_setValue(P_OFF, JSON.stringify(po.off)); } catch (err) {}
+      try { profilesFromHub(JSON.parse(d.slice(14))); } catch (err) {}
     }
     else if (d.indexOf('MHUB-SITES:') === 0) {
       try { var list = JSON.parse(d.slice(11)); if (Array.isArray(list)) GM_setValue('mhub_sites', JSON.stringify(list)); } catch (err) {}
@@ -672,6 +691,8 @@ if (isHub || topMode) {
 
 /* ---------- Auf den Scan-Seiten ---------- */
 if (window.top !== window.self) return;
+// Seite einlernen (13-einlernen): im Tampermonkey-Menü auf jeder Seite, auch noch nicht eingeschalteten
+if (typeof GM_registerMenuCommand === 'function') GM_registerMenuCommand(L('Seite einlernen …', 'Teach this site …'), learnStart);
 // Nur auf eingeschalteten Scan-Seiten (Wörter vom Hub, ohne die in den Einstellungen abgeschalteten)
 if (!siteActive(location.href)) return;
 var path = '', cur = 0, box = null, imgCount = -1, dirty = false, lastWrite = 0, flashUntil = 0, queued = false, restoring = false, touched = false;
@@ -846,7 +867,7 @@ function buildReader() {
   readerStyle = document.createElement('style');
   // scroll-behavior: manche Seiten scrollen weich (CSS) – dann wären Sprünge des Lesers als schnelles Scrollen zu sehen
   readerStyle.textContent = 'html,body{background:#000!important;overflow-x:hidden!important;overflow-y:auto!important;margin:0!important;scroll-behavior:auto!important}' +
-    'body>*:not(#mhub-reader):not(#mhub-dock):not(#mhub-nav):not(#mhub-peek):not(#mhub-fade):not(#mhub-next):not(#mhub-prev):not(#mhub-ask){display:none!important}' +
+    'body>*:not(#mhub-reader):not(#mhub-dock):not(#mhub-nav):not(#mhub-peek):not(#mhub-fade):not(#mhub-next):not(#mhub-prev):not(#mhub-ask):not(#mhub-learn):not(#mhub-learn-mark){display:none!important}' +
     '#mhub-nav{display:flex!important;flex-wrap:wrap;gap:8px;max-width:var(--mhub-w,820px);margin:0 auto;padding:18px 12px 120px;background:#000;font:700 15px system-ui,sans-serif}' +
     '#mhub-nav a{flex:1;display:flex;align-items:center;justify-content:center;min-height:52px;border-radius:12px;background:#2a2639;color:#ece9f6;text-decoration:none;text-align:center;padding:0 10px}' +
     '#mhub-nav a.nx{background:#913fe2;color:#fff;flex:1.4}#mhub-nav span{flex:1.4;display:flex;align-items:center;justify-content:center;color:#9893b0}' +
@@ -1775,6 +1796,17 @@ function slugBase(u) {
   return u.replace(/\/$/, '').split('/').pop().toLowerCase()
     .replace(/-[a-z0-9]{8}$/, function (m) { return /\d/.test(m) ? '' : m; });
 }
+/* Gehört die (Kapitel-)Adresse zur Serie base? Ein Teil des Pfads ist base selbst, base mit Kennung (Asura: …-1a2b3c4d) oder
+   base direkt vor dem Kapitel (Thunder: held-der-zeit-chapter-12, Roman: …-novel-chapter-3). Nicht: eine andere Serie,
+   deren Name mit base anfängt (Solo Leveling und Solo Leveling: Ragnarok auf derselben Seite). */
+function slugIn(u, base) {
+  if (!base) return true;
+  return pathOf(u).toLowerCase().split('/').some(function (s) {
+    if (s.indexOf(base) !== 0) return false;
+    var r = s.slice(base.length);
+    return !r || /^[-_](?=[a-z]*\d)[a-z0-9]{8}$/.test(r) || /^[-_.](?:novel[-_])?(?:chapter|chap|ch|episode|ep|kapitel)[-_.]?\d/.test(r);
+  });
+}
 function chOf(u) { var m = pathOf(u).toLowerCase().match(CHNUM); return m ? parseFloat(m[1].replace(/[-_]/, '.')) : null; }
 function isSeriesUrl(u) { var p = pathOf(u); return !!p && SERIES.test(p) && !CH.test(p.toLowerCase()); }
 function onlySeries(el, key, base) {
@@ -1782,7 +1814,7 @@ function onlySeries(el, key, base) {
   for (var i = 0; i < as.length; i++) {
     var u = absUrl(as[i].getAttribute('href'));
     if (isSeriesUrl(u)) { if (canonUrl(u.replace(/\/$/, '')) !== key) return false; }
-    else if (chOf(u) != null && pathOf(u).toLowerCase().indexOf(base) < 0) return false;
+    else if (chOf(u) != null && !slugIn(u, base)) return false;
   }
   return true;
 }
@@ -2547,7 +2579,7 @@ function libEntry(key) {
 // Stand aus dem Hub, ergänzt um das, was du auf diesem Gerät seitdem gelesen hast
 function seriesState(e, base) {
   var st = { r: e.r || 0, c: e.c ? { n: e.c.n, pct: e.c.pct, url: '' } : null, u: e.u || '', n: e.n }, l = get(LOG);
-  Object.keys(l).filter(function (k) { return pathOf(k).toLowerCase().indexOf(base) > -1 && sameKind(k, location.href) && l[k].t > (e.at || 0); })
+  Object.keys(l).filter(function (k) { return slugIn(k, base) && sameKind(k, location.href) && l[k].t > (e.at || 0); })
     .sort(function (a, b) { return l[a].t - l[b].t; })
     .forEach(function (k) {
       var n = chOf(k); if (n == null) return;
@@ -2754,7 +2786,348 @@ if (typeof GM_registerMenuCommand === 'function') {
 if (GM_addValueChangeListener) GM_addValueChangeListener('mhub_prefs', function () { if (reader) applyWidth(); });
 setInterval(function () { route(); if (isChapter()) onScroll(); else { seriesCard(); refreshRel(); } }, 1200);
 route();
-if (!isChapter()) flash(L('📖 Manhwa Hub aktiv', '📖 Manhwa Hub active'));
+if (!isChapter()) { flash(L('📖 Manhwa Hub aktiv', '📖 Manhwa Hub active')); setTimeout(learnOffer, 4000); }
+/* ---------- Seite einlernen ----------
+   Auf einer Scan-Seite tippst du an, wo Titel, Kapitel-Liste, Beschreibung und das Bezahlt-Symbol stehen; in einem Kapitel
+   findet das Skript die Seitenbilder meist selbst (sonst ein Bild antippen). Daraus entsteht ein Profil wie in
+   src/profiles (nur Selektoren). Es gilt sofort auf diesem Gerät (mhub_learned) und geht mit dem nächsten Abgleich an den
+   Hub, der es im Konto speichert und an alle Geräte schickt (MHUB-PROFILES). Ein eingelerntes Profil ergänzt das
+   vorhandene der Seite und gilt, bis eines mit neuerem Datum kommt (pNewer). Start: Tampermonkey-Menü „Seite einlernen“
+   (auf jeder Seite) oder die Frage auf Serienseiten von Seiten ohne Profil (learnOffer).
+   Hier nur Funktionen, keine Variablen auf oberster Ebene: auf noch nicht eingeschalteten Seiten endet das Skript vorher
+   (02-leiste), die Funktionen gibt es trotzdem, ihre Variablen nicht. */
+
+// Unsere eigenen Elemente (Leiste, Leser, dieses Feld) zählen nie mit
+function ownUi(el) { return !!(el && el.closest && el.closest('[id^="mhub"]')); }
+function qAll(root, sel) { return pAll(root, sel).filter(function (e) { return !ownUi(e); }); }
+function tidy(el) { return textOf(el).replace(/\s+/g, ' ').trim(); }
+// Klassen und ids, die eine Seite nicht bei jedem Bauen neu würfelt (keine Hashes wie css-1x2y3z, sc-…, jsx-123)
+function okTok(t) {
+  return /^[A-Za-z_][\w-]{1,39}$/.test(t) && !/^mhub/i.test(t) && !/^(css|sc|jsx|svelte|astro|emotion|styled)-/i.test(t) && !/\d{3,}/.test(t) &&
+    !t.split(/[-_]+/).some(function (s) { return s.length >= 4 && /\d/.test(s) && /[a-z]/i.test(s); });
+}
+// Einfache Selektoren für ein Element, vom kürzesten an: #id, tag.klasse, tag[itemprop], tag.klasse.klasse, tag
+function selParts(el) {
+  var tag = el.tagName.toLowerCase(), out = [], cls = [].filter.call(el.classList || [], okTok);
+  if (el.id && okTok(el.id)) out.push('#' + el.id);
+  cls.forEach(function (c) { out.push(tag + '.' + c); });
+  var ip = el.getAttribute('itemprop'); if (ip && /^\w+$/.test(ip)) out.push(tag + '[itemprop="' + ip + '"]');
+  if (cls.length > 1) out.push(tag + '.' + cls[0] + '.' + cls[1]);
+  out.push(tag);
+  return out;
+}
+// Selektor, der dieses Element trifft – am liebsten als einziges, sonst als erstes; Vorfahren mit id/Klasse helfen nach.
+// Ein bloßer Tag (p, div) allein ist zu allgemein für andere Serienseiten; nur h1 darf allein stehen.
+function uniqueSel(el) {
+  var first = '', anc = [null];
+  for (var a = el.parentElement, i = 0; i < 5 && a && a !== document.body; a = a.parentElement, i++) anc.push(a);
+  for (var j = 0; j < anc.length; j++) {
+    var pre = anc[j] ? selParts(anc[j]).filter(function (s) { return /[#.\[]/.test(s); }) : [''], ps = selParts(el);
+    for (var k = 0; k < pre.length; k++) for (var m = 0; m < ps.length; m++) {
+      if (!pre[k] && !/[#.\[]/.test(ps[m]) && ps[m] !== 'h1') continue;
+      var s = (pre[k] ? pre[k] + ' ' : '') + ps[m], hit = qAll(document, s);
+      if (hit[0] !== el) continue;
+      if (hit.length === 1) return s;
+      if (!first) first = s;
+    }
+  }
+  return first;
+}
+// Kleinster Rahmen um start, der einen Anteil der Elemente enthält (Kapitel-Liste, Bilderbereich)
+function learnHolder(start, els, share) {
+  var need = Math.max(2, Math.ceil(els.length * share));
+  for (var a = start.parentElement; a && a !== document.body && a !== document.documentElement; a = a.parentElement) {
+    var n = 0; for (var i = 0; i < els.length; i++) if (a.contains(els[i])) n++;
+    if (n >= need) return a;
+  }
+  return null;
+}
+
+function learnTitle(t) {
+  var el = t.closest('h1,h2,h3') || t, x = tidy(el);
+  if (!x || x.length > 200 || el === document.body) return null;
+  var sel = uniqueSel(el); return sel ? { el: el, sel: sel, text: x } : null;
+}
+function learnDesc(t) {
+  var el = t;
+  for (var i = 0; i < 3 && el.parentElement && tidy(el).length < 40; i++) el = el.parentElement;
+  var x = tidy(el); if (x.length < 40 || x.length > 8000 || el === document.body) return null;
+  var sel = uniqueSel(el); return sel ? { el: el, sel: sel, text: x } : null;
+}
+// Kapitel-Liste: Rahmen um den angetippten Kapitel-Link, der die meisten Kapitel dieser Serie enthält (ohne Seitenleisten)
+function learnChapters(t, page) {
+  var a = t.closest('a[href]'), links = seriesChapters(document, page, true).map(function (c) { return c.a; });
+  // Neben den Link getippt (Datum, Zeile): die Zeile, in der genau ein Kapitel-Link steht
+  for (var e = t; (!a || links.indexOf(a) < 0) && e && e !== document.body; e = e.parentElement) {
+    var inside = links.filter(function (x) { return e.contains(x); });
+    if (inside.length === 1) a = inside[0]; else if (inside.length > 1) break;
+  }
+  if (!a || links.indexOf(a) < 0) return null;
+  var box = learnHolder(a, links, 0.8), bs = box && uniqueSel(box), link = bs ? bs + ' a[href]' : '';
+  var mine = link ? qAll(document, link).filter(function (x) { return links.indexOf(x) > -1; }) : links;
+  if (!mine.length) { link = ''; mine = links; }
+  var nums = mine.map(function (x) { return chOf(absUrl(x.getAttribute('href'), page)); });
+  return { el: box || a, link: link, date: learnDate(a, mine), links: mine, lo: Math.min.apply(null, nums), hi: Math.max.apply(null, nums) };
+}
+// Spezifische Selektoren (mit Klasse, id, Attribut) vor bloßen Tags
+function bySpecific(list) { var sp = function (s) { return /[.#\[]/.test(s) ? 0 : 1; }; return list.sort(function (x, y) { return sp(x) - sp(y); }); }
+// Datum in der Kapitel-Zeile: ein Element, das bei den meisten Kapiteln ein Datum enthält (wie chapterDate es liest);
+// das Datum selbst oder ein Rahmen, der nur es enthält (<span class="date"><i>…</i></span>)
+function learnDate(a, links) {
+  var row = chapterRow(a), rows = links.slice(0, 40), cands = [];
+  [].forEach.call(row.querySelectorAll('*'), function (el) {
+    if ((el.childElementCount && el.tagName !== 'TIME') || ownUi(el) || !(timeAttr(el) || parseDate(tidy(el)))) return;
+    for (var e = el; e && e !== row && (e === el || e.childElementCount === 1); e = e.parentElement)
+      selParts(e).forEach(function (s) { if (cands.indexOf(s) < 0) cands.push(s); });
+  });
+  bySpecific(cands);
+  var hits = function (s) { return rows.filter(function (x) { var d = pAll(chapterRow(x), s)[0] || pAll(x, s)[0]; return d && (timeAttr(d) || parseDate(tidy(d))); }).length; };
+  for (var i = 0; i < cands.length; i++) if (hits(cands[i]) >= Math.ceil(rows.length * 0.6)) return cands[i];
+  return '';
+}
+// Bezahlt-Symbol: angetipptes Element (oder ein Rahmen davon in der Zeile), das nur bei einem Teil der Kapitel vorkommt
+function learnLock(t, links) {
+  var a = null;
+  for (var i = 0; i < links.length && !a; i++) if (chapterRow(links[i]).contains(t)) a = links[i];
+  if (!a) return null;
+  var row = chapterRow(a), rows = links.map(chapterRow), cands = [];
+  for (var el = t; el && el !== row.parentElement; el = el.parentElement) {
+    selParts(el).forEach(function (s) { if (cands.indexOf(s) < 0) cands.push(s); });
+    var stem = el.tagName === 'IMG' ? imgStem(el.getAttribute('src') || '') : '';
+    if (stem && okTok(stem)) cands.push('img[src*="' + stem + '"]');
+  }
+  var has = function (r, s) { try { return r.matches(s) || !!r.querySelector(s); } catch (e) { return false; } };
+  bySpecific(cands);
+  for (var j = 0; j < cands.length; j++) {
+    var n = rows.filter(function (r) { return has(r, cands[j]); }).length;
+    if (has(row, cands[j]) && (rows.length < 4 || n <= rows.length * 0.6)) return { el: t, sel: cands[j], n: n };
+  }
+  return null;
+}
+// Seitenbilder: ohne Antippen die der allgemeinen Erkennung, sonst die großen Bilder um das angetippte; dann der genaueste
+// Selektor (Rahmen + gemeinsame Klasse), der fast alle trifft und kaum anderes (Werbung, Cover)
+function learnImgs(t, e) {
+  var page = location.href, els = null;
+  if (t) {
+    var im = t.tagName === 'IMG' ? t : (document.elementsFromPoint ? document.elementsFromPoint(e.clientX, e.clientY) : []).filter(function (x) { return x.tagName === 'IMG'; })[0];
+    if (!im || ownUi(im)) return null;
+    // Große Bilder aus demselben Ordner wie das angetippte (Zahlen gleichgesetzt), im kleinsten Rahmen mit mindestens drei
+    var dir = function (x) { return imgAbs(imgAttr(x), page).split(/[?#]/)[0].replace(/[^\/]*$/, '').replace(/\d+/g, '#'); }, d0 = dir(im);
+    var big = function (x) { return dir(x) === d0 && (+x.getAttribute('width') || x.naturalWidth || x.getBoundingClientRect().width) >= 200; };
+    for (var a = im.parentElement; a && a !== document.body && !els; a = a.parentElement) { var bi = qAll(a, 'img').filter(big); if (bi.length >= 3) els = bi; }
+  } else {
+    var set = {}; chapterImgList('', document, page, true).forEach(function (u) { set[u] = 1; });
+    els = qAll(document, 'img').filter(function (x) { return set[imgAbs(imgAttr(x), page)]; });
+  }
+  if (!els || els.length < 2) return null;
+  var hold = learnHolder(els[0], els, 0.9), hs = hold && uniqueSel(hold), cands = [], best = null;
+  [].filter.call(els[0].classList, function (c) { return okTok(c) && els.every(function (x) { return x.classList.contains(c); }); })
+    .forEach(function (c) { if (hs) cands.push(hs + ' img.' + c); cands.push('img.' + c); });
+  if (hs) cands.push(hs + ' img');
+  cands.forEach(function (s) {
+    var hit = qAll(document, s), good = hit.filter(function (x) { return els.indexOf(x) > -1; }).length;
+    if (!hit.length || good < els.length * 0.9) return;
+    if (!best || good / hit.length > best.prec) best = { sel: s, prec: good / hit.length, n: good };
+  });
+  return best && best.prec >= 0.8 ? { el: hold || els[0], sel: best.sel, n: best.n } : null;
+}
+// Suchadresse: aus den Seitendaten (JSON-LD SearchAction), sonst aus dem Suchfeld der Seite; nur auf dieser Seite
+function learnSearch() {
+  var tpl = '';
+  pAll(document, 'script[type="application/ld+json"]').forEach(function (sc) {
+    var j = null; try { j = JSON.parse(sc.textContent); } catch (e) { return; }
+    (function walk(o, d) {
+      if (tpl || !o || typeof o !== 'object' || d > 6) return;
+      var t = o.target, nm = String(o['query-input'] || '').match(/name=(\w+)/);
+      if (/SearchAction/.test(String(o['@type']))) { t = t && typeof t === 'object' ? t.urlTemplate : t; if (typeof t === 'string' && nm) tpl = t.split('{' + nm[1] + '}').join('{q}'); }
+      Object.keys(o).forEach(function (k) { walk(o[k], d + 1); });
+    })(j, 0);
+  });
+  if (!tpl) {
+    var inp = qAll(document, 'form input[type="search"], form input[name="s"], form input[name="q"], form input[name="search"], form input[name="query"], form input[name="keyword"], form input[name="searchTerm"]')[0], f = inp && inp.form;
+    if (f && inp.name && (f.getAttribute('method') || 'get').toLowerCase() === 'get') {
+      var qs = pAll(f, 'input[type="hidden"][name]').map(function (h) { return encodeURIComponent(h.name) + '=' + encodeURIComponent(h.value); });
+      tpl = (f.getAttribute('action') || location.pathname) + '?' + qs.concat([encodeURIComponent(inp.name) + '={q}']).join('&');
+    }
+  }
+  try {
+    var u = new URL(tpl.replace('{q}', 'QQQMHUB'), location.href), same = u.hostname.replace(/^www\./, '') === location.hostname.replace(/^www\./, '');
+    return tpl && same ? (u.pathname + u.search).replace('QQQMHUB', '{q}') : '';
+  } catch (e) { return ''; }
+}
+
+// Profil speichern: das vorhandene der Seite ergänzen, sonst ein neues mit dem Namen der Seite als Wort
+function siteWord(host) {
+  var h = String(host).toLowerCase().replace(/^www\./, ''), parts = h.split('.'), w = parts.length > 1 ? parts[parts.length - 2] : parts[0];
+  if (parts.length > 2 && /^(co|com|net|org)$/.test(w)) w = parts[parts.length - 3];
+  w = w.replace(/[^a-z0-9-]/g, '');
+  return w.length >= 3 ? w : h.replace(/[^a-z0-9.-]/g, '');
+}
+function learnSave(base, got) {
+  var word = siteWord(location.hostname), og = document.querySelector('meta[property="og:site_name"]'), name = og && og.content ? og.content.trim() : '';
+  var p = base ? JSON.parse(JSON.stringify(base)) : { id: word.replace(/\./g, '-'), name: name && name.length <= 40 ? name : word.charAt(0).toUpperCase() + word.slice(1), v: 1, match: [word] };
+  delete p.note; delete p.checked; p.learned = Date.now();
+  Object.keys(got).forEach(function (k) {
+    var ks = k.split('.'); if (ks.length < 2) { p[k] = got[k]; return; }
+    var g = {}, old = p[ks[0]] || {}; Object.keys(old).forEach(function (x) { g[x] = old[x]; });
+    g[ks[1]] = got[k]; p[ks[0]] = g;
+  });
+  var mine = gmList(P_MINE).filter(function (x) { return x && x.id !== p.id; }); mine.push(p);
+  GM_setValue(P_MINE, JSON.stringify(mine.slice(-20)));
+  var h = get(P_HEALTH); if (h[p.id]) { delete h[p.id]; put(P_HEALTH, h); } // neu eingelernt: alter Selbsttest gilt nicht mehr
+  return p;
+}
+
+// Feld unten auf der Seite; Inhalte nur als Text (nie HTML der Seite). Knöpfe: [Text, Aktion, hervorgehoben]
+function learnBox(id) {
+  var old = document.getElementById(id); if (old) old.remove();
+  var el = document.createElement('div'); el.id = id;
+  el.style.cssText = 'position:fixed;left:50%;transform:translateX(-50%);bottom:calc(64px + env(safe-area-inset-bottom, 0px));width:min(440px,calc(100vw - 16px));box-sizing:border-box;z-index:2147483647;' +
+    'background:#17121f;color:#f3f0fa;border:1px solid #913fe2;border-radius:14px;padding:12px 14px;box-shadow:0 6px 24px rgba(0,0,0,.55);font:500 14px/1.4 system-ui,sans-serif;text-align:left';
+  (document.body || document.documentElement).appendChild(el);
+  var add = function (tag, txt, css) { var x = document.createElement(tag); x.textContent = txt; x.style.cssText = css; el.appendChild(x); return x; };
+  return {
+    el: el,
+    show: function (head, text, note, buttons, warn) {
+      el.textContent = '';
+      add('div', head, 'font-size:12px;color:#ab6bf0;font-weight:700;margin-bottom:4px');
+      add('div', text, 'font-weight:700');
+      if (note) add('div', note, 'margin-top:6px;font-size:13px;white-space:pre-line;color:' + (warn ? '#f0a35a' : '#c9c3dc'));
+      var row = add('div', '', 'display:flex;flex-wrap:wrap;gap:8px;margin-top:10px');
+      buttons.forEach(function (b) {
+        var x = document.createElement('button'); x.type = 'button'; x.textContent = b[0];
+        x.style.cssText = 'flex:1;min-height:40px;border-radius:10px;border:0;font:700 14px system-ui,sans-serif;cursor:pointer;padding:0 12px;' + (b[2] ? 'background:#913fe2;color:#fff' : 'background:#2a2639;color:#ece9f6');
+        x.addEventListener('click', function (ev) { ev.stopPropagation(); b[1](); });
+        row.appendChild(x);
+      });
+    },
+    close: function () { el.remove(); }
+  };
+}
+// Rahmen um das erkannte Element (folgt beim Scrollen), der Rest der Seite leicht abgedunkelt
+function learnMark() {
+  var m = document.createElement('div'), el = null;
+  m.id = 'mhub-learn-mark';
+  m.style.cssText = 'position:fixed;pointer-events:none;z-index:2147483646;border:3px solid #ab6bf0;border-radius:6px;box-shadow:0 0 0 9999px rgba(10,6,20,.35);display:none';
+  var place = function () {
+    if (!el) return;
+    var r = el.getBoundingClientRect();
+    m.style.left = (r.left - 4) + 'px'; m.style.top = (r.top - 4) + 'px'; m.style.width = (r.width + 8) + 'px'; m.style.height = (r.height + 8) + 'px';
+  };
+  window.addEventListener('scroll', place, true);
+  (document.body || document.documentElement).appendChild(m);
+  return {
+    on: function (x) { el = x; m.style.display = 'block'; place(); },
+    hide: function () { el = null; m.style.display = 'none'; },
+    remove: function () { window.removeEventListener('scroll', place, true); m.remove(); }
+  };
+}
+// Im Lesemodus „Nur Bilder“ ist die Originalseite versteckt: zum Antippen kurz zeigen
+function readerShown(on) {
+  if (typeof readerStyle !== 'undefined' && readerStyle) readerStyle.media = on ? '' : 'not all';
+  var r = document.getElementById('mhub-reader'); if (r) r.style.display = on ? '' : 'none';
+}
+
+function learnStart() {
+  if (document.getElementById('mhub-learn')) return;
+  var url = location.href, page = canonUrl(location.origin + location.pathname.replace(/\/$/, ''));
+  var isCh = chOf(url) != null, base = profileFor(url), wasActive = siteActive(url);
+  var box = learnBox('mhub-learn'), mark = learnMark(), got = {}, done = [], chap = null, i = 0, cur = null, steps;
+  var HEAD = L('Seite einlernen', 'Teach this site');
+  var head = function () { return HEAD + (steps.length > 1 ? ' · ' + (i + 1) + '/' + steps.length : ''); };
+  // Ein Schritt: Frage, pick(angetipptes Element, Ereignis) → {el, set: {Eintrag: Selektor}, show} oder {err}
+  var one = function (key, q, learn, show, err, optional, skip) {
+    return { q: q, optional: optional, skip: skip, pick: function (t) {
+      var r = learn(t); if (!r) return { err: err };
+      var set = {}; set[key] = r.sel; return { el: r.el, set: set, show: show(r) };
+    } };
+  };
+  var quote = function (x) { return L('„', '“') + (x.length > 70 ? x.slice(0, 70) + '…' : x) + L('“', '”'); };
+  var IMG = { q: L('Tippe auf ein Seitenbild des Kapitels.', 'Tap one page image of the chapter.'), pick: function (t, e) {
+    var r = learnImgs(t, e); if (!r) return { err: L('Dort habe ich keine Seitenbilder gefunden. Tippe direkt auf ein Bild.', 'No page images there. Tap directly on an image.') };
+    return { el: r.el, set: { 'pages.img': r.sel }, show: L('Seitenbilder: ', 'Page images: ') + r.n };
+  } };
+  steps = isCh ? [IMG] : [
+    one('series.title', L('Tippe auf den Titel der Serie.', 'Tap the series title.'), learnTitle, function (r) { return L('Titel: ', 'Title: ') + quote(r.text); },
+      L('Das sieht nicht nach einem Titel aus. Tippe direkt auf den Namen der Serie.', "That doesn't look like a title. Tap the series name itself.")),
+    { q: L('Tippe auf ein Kapitel in der Liste.', 'Tap a chapter in the list.'), pick: function (t) {
+      var r = learnChapters(t, page);
+      if (!r) return { err: L('Das ist kein Kapitel dieser Serie. Tippe auf einen Eintrag der Kapitel-Liste.', "That's not a chapter of this series. Tap an entry of the chapter list.") };
+      chap = r;
+      return { el: r.el, set: { 'chapters.link': r.link, 'chapters.date': r.date },
+        show: L('Kapitel: ', 'Chapters: ') + r.links.length + ' (' + r.lo + '–' + r.hi + ')' + (r.date ? L(', mit Datum', ', with dates') : '') + (r.link ? '' : L(' – allgemeine Erkennung reicht hier', ' – general detection is enough here')) };
+    } },
+    one('series.desc', L('Tippe auf die Beschreibung der Serie.', 'Tap the series description.'), learnDesc, function (r) { return L('Beschreibung: ', 'Description: ') + quote(r.text); },
+      L('Dort steht keine Beschreibung. Tippe mitten in den Text.', 'No description there. Tap inside the text.'), true),
+    one('chapters.lock', L('Kosten manche Kapitel etwas? Tippe auf ihr Schloss- oder Münz-Symbol.', 'Are some chapters paid? Tap their lock or coin icon.'),
+      function (t) { return chap && learnLock(t, chap.links); }, function (r) { return L('Bezahlt: ', 'Paid: ') + r.n + L(' Kapitel markiert', ' chapters marked'); },
+      L('Das gehört zu keinem Kapitel oder steht bei fast allen. Tippe auf das Symbol eines bezahlten Kapitels.', 'Not part of a chapter, or on almost all of them. Tap the icon of a paid chapter.'), true, L('Keine bezahlten', 'None paid'))
+  ];
+
+  // Antippen abfangen: die Seite bekommt währenddessen keine Klicks (keine Links, keine Werbung)
+  var TYPES = ['click', 'auxclick', 'pointerdown', 'pointerup', 'mousedown', 'mouseup', 'touchend'];
+  var stop = function (e) {
+    if (box.el.contains(e.target)) return;
+    e.stopImmediatePropagation();
+    if (e.type === 'click' || e.type === 'auxclick') { e.preventDefault(); if (e.type === 'click' && cur) picked(e); }
+  };
+  TYPES.forEach(function (t) { window.addEventListener(t, stop, true); });
+  var unhook = function () { TYPES.forEach(function (t) { window.removeEventListener(t, stop, true); }); readerShown(true); mark.hide(); cur = null; };
+  var end = function () { unhook(); mark.remove(); box.close(); };
+
+  var ask = function (note) {
+    cur = steps[i]; mark.hide();
+    var bs = cur.optional ? [[cur.skip || L('Überspringen', 'Skip'), next]] : [];
+    box.show(head(), cur.q, note || '', bs.concat([[L('Abbrechen', 'Cancel'), end]]), !!note);
+  };
+  var next = function () { i++; if (i < steps.length) ask(); else summary(); };
+  var picked = function (e) {
+    var r = cur.pick(e.target, e);
+    if (r.err) return ask(r.err);
+    mark.on(r.el);
+    box.show(head(), cur.q, '✓ ' + r.show, [[L('Passt', 'Looks right'), function () {
+      Object.keys(r.set).forEach(function (k) { if (r.set[k]) got[k] = r.set[k]; });
+      done.push(r.show); next();
+    }, true], [L('Nochmal', 'Again'), function () { ask(); }]]);
+  };
+  var summary = function (more) {
+    cur = null; mark.hide(); readerShown(true);
+    var s = !isCh && learnSearch(); if (s) { got.search = s; done.push(L('Suche: ', 'Search: ') + s); }
+    if (!Object.keys(got).length) return box.show(HEAD, L('Nichts eingelernt.', 'Nothing learned.'), '', [[L('Schließen', 'Close'), end]]);
+    box.show(HEAD, L('Speichern?', 'Save?'), done.join('\n'), [[L('Speichern', 'Save'), save, true]].concat(more || [], [[L('Abbrechen', 'Cancel'), end]]));
+  };
+  var save = function () {
+    var p = learnSave(base, got);
+    unhook();
+    var tip = !isCh && !(p.pages && p.pages.img) ? L('Tipp: In einem Kapitel lassen sich auch die Seitenbilder einlernen.', 'Tip: page images can be taught in a chapter.')
+      : isCh && !(p.series && p.series.title) ? L('Tipp: Auf einer Serienseite lassen sich Titel und Kapitel einlernen.', 'Tip: title and chapters can be taught on a series page.') : '';
+    box.show(HEAD, L('Gespeichert ✓', 'Saved ✓'), L('Gilt ab jetzt auf diesem Gerät. Öffne den Hub, dann auch auf deinen anderen Geräten.', 'Active on this device now. Open the hub to use it on your other devices too.') + (tip ? '\n' + tip : ''),
+      wasActive ? [[L('Fertig', 'Done'), end, true]] : [[L('Neu laden', 'Reload'), function () { location.reload(); }, true], [L('Später', 'Later'), end]]);
+  };
+
+  if (!isCh) return ask();
+  // Kapitel: Seitenbilder zuerst selbst suchen, nur wenn das nicht klappt (oder nicht stimmt) antippen lassen
+  var auto = learnImgs(null);
+  var tapImg = function (note) { got = {}; done = []; readerShown(false); ask(note); };
+  if (!auto) return tapImg(L('Die Seitenbilder habe ich nicht selbst gefunden.', "I couldn't find the page images myself."));
+  got['pages.img'] = auto.sel; done.push(L('Seitenbilder: ', 'Page images: ') + auto.n + L(' erkannt', ' found'));
+  summary([[L('Stimmt nicht', "That's wrong"), function () { tapImg(); }]]);
+}
+
+// Serienseite einer eingeschalteten Seite ohne Profil: einmal fragen, ob sie eingelernt werden soll (später: nach 7 Tagen)
+function learnOffer() {
+  var url = location.href, page = canonUrl(location.origin + location.pathname.replace(/\/$/, ''));
+  if (profileFor(url) || chOf(url) != null || document.getElementById('mhub-learn')) return;
+  var ask = get('mhub_learnask'), h = location.hostname, now = Date.now();
+  if ((ask[h] || 0) > now || seriesChapters(document, page, true).length < 3) return;
+  var box = learnBox('mhub-learn'), t = 0;
+  var later = function (ms) { clearTimeout(t); ask[h] = now + ms; put('mhub_learnask', ask); box.close(); };
+  t = setTimeout(function () { later(864e5); }, 20000);
+  box.show('Manhwa Hub', L('Diese Seite genauer kennenlernen?', 'Get to know this site better?'),
+    L('Tippe einmal auf Titel und ein Kapitel, dann liest das Skript hier Kapitel, Daten und Beschreibung genauer. Dauert etwa 20 Sekunden.', 'Tap the title and one chapter once, and the script reads chapters, dates and description here more precisely. Takes about 20 seconds.'),
+    [[L('Einlernen', 'Teach'), function () { clearTimeout(t); box.close(); learnStart(); }, true],
+     [L('Später', 'Later'), function () { later(7 * 864e5); }], [L('Nie', 'Never'), function () { later(9e15); }]]);
+}
 
 })({ GM_getValue: GM_getValue, GM_setValue: GM_setValue, GM_setClipboard: GM_setClipboard,
   GM_xmlhttpRequest: GM_xmlhttpRequest, GM_registerMenuCommand: GM_registerMenuCommand,
