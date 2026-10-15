@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.51.0
+// @version      3.52.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var hubMark = !!document.querySelector('[data-mhub]'), isHub = false;
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.51.0';
+var VERSION = '3.52.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -61,12 +61,24 @@ function coverStem(doc) { var og = (doc || document).querySelector('meta[propert
    Ordner gruppieren (Zahlen gleichgesetzt: manche Seiten legen jede Seite in einen eigenen Nummern-Ordner) und die größte
    Gruppe nehmen, in der Reihenfolge der Seite; ein Ordner mit „chapter“ oder der Kapitelnummer zählt mehr. Cover
    (og:image), Logos und kleine Bilder fallen weg, dieselbe Datei mit anderem ?v= nur einmal. */
+// Bildadresse aus den Attributen (abgerufene Seiten haben kein currentSrc): größte aus srcset, sonst Lazy-Attribut statt Platzhalter
+function imgAttr(im) {
+  var set = im.getAttribute('srcset') || im.getAttribute('data-srcset') || '', fromSet = set ? pickSet(set) : '';
+  if (fromSet && !/^data:/.test(fromSet)) return fromSet;
+  var ds = im.getAttribute('data-src') || im.getAttribute('data-lazy-src') || im.getAttribute('data-original') || im.getAttribute('data-url') || '';
+  var s = im.getAttribute('src') || '';
+  return ds && (!s || /^data:|blank|placeholder|loading|lazy/i.test(s)) ? ds : s;
+}
 function chapterImgList(html, doc, base) {
   var abs = function (u) {
     try { u = new URL(String(u || '').trim(), base).href; } catch (e) { return ''; }
     try { var x = new URL(u); if (/\/_next\/image/.test(x.pathname) && x.searchParams.get('url')) u = new URL(x.searchParams.get('url'), base).href; } catch (e) {}
     return /^https?:\/\//.test(u) ? u : '';
   };
+  // Laut Profil stehen die Seitenbilder hier (mindestens zwei, sonst wie unten raten)
+  var own = [];
+  if (doc) profEls(bindProfile(doc, base), 'pages.img').forEach(function (im) { var u = abs(imgAttr(im)); if (u && own.indexOf(u) < 0) own.push(u); });
+  if (own.length >= 2) { profReport(doc, 'pages.img', true); return own.slice(0, 400); }
   var og = doc && doc.querySelector('meta[property="og:image"]'), ogStem = og && og.content ? imgStem(og.content) : '';
   var cm = String(base || '').toLowerCase().match(CHNUM), cn = cm ? cm[1].replace(/[-_]/g, '.') : '';
   var seen = {}, groups = {}, order = [];
@@ -81,11 +93,7 @@ function chapterImgList(html, doc, base) {
   };
   if (doc) [].forEach.call(doc.querySelectorAll('img'), function (im) {
     var w = +im.getAttribute('width'); if (w && w < 250) return;
-    var set = im.getAttribute('srcset') || im.getAttribute('data-srcset') || '', fromSet = set ? pickSet(set) : '';
-    var ds = im.getAttribute('data-src') || im.getAttribute('data-lazy-src') || im.getAttribute('data-original') || im.getAttribute('data-url') || '';
-    var s = im.getAttribute('src') || '';
-    if (ds && (!s || /^data:|blank|placeholder|loading|lazy/i.test(s))) s = ds;
-    add(fromSet && !/^data:/.test(fromSet) ? fromSet : s);
+    add(imgAttr(im));
   });
   if (html) {
     var t = String(html).replace(/\\+u002[fF]/g, '/').replace(/\\+\//g, '/').replace(/\\+u0026/g, '&').replace(/&quot;|&#34;|&#x22;/gi, '"').replace(/&#39;|&#x27;/gi, "'").replace(/&amp;/g, '&'), m;
@@ -94,6 +102,7 @@ function chapterImgList(html, doc, base) {
   }
   var best = null;
   order.forEach(function (k) { var g = groups[k]; if (!best || g.u.length * g.w > best.u.length * best.w) best = g; });
+  if (doc) profReport(doc, 'pages.img', false, !!best && best.u.length >= 2);
   return best ? best.u.slice(0, 400) : [];
 }
 /* ---- Bezahlte Kapitel (Early Access, Coins, Premium) ----
@@ -105,8 +114,8 @@ function chapterImgList(html, doc, base) {
    Ergebnis: {Kapitelnummer: frei ab (ms) oder 0 = unbekannt}. */
 var LOCK_TOK = /(^|[-_])(paid|locked?|premium|vip|coins?|crown|early-?access)([-_]|$)/i, LOCK_NOT = /unlock|free|open|unpaid/i;
 function lockOfLink(a) {
-  var row = a;
-  for (var i = 0; i < 2 && row.parentElement && row.parentElement.querySelectorAll('a[href]').length === 1; i++) row = row.parentElement;
+  if (profLocked(a)) return true;
+  var row = chapterRow(a);
   var els = [a, row].concat([].slice.call(row.querySelectorAll('*'), 0, 80));
   for (var j = 0; j < els.length; j++) {
     var el = els[j], cls = String((el.getAttribute && el.getAttribute('class')) || '');
@@ -157,23 +166,21 @@ function lockJson(root, base) {
   });
   return { lock: lock, free: free };
 }
-// Gesperrte Kapitel einer Serie auf einer Seite (root = Dokument, page = Adresse, mine(u) = gehört der Link zur Serie?)
-function lockedChapters(root, page, mine, base) {
+// Gesperrte Kapitel einer Serie auf einer Seite (root = Dokument, page = Adresse der Serienseite)
+function lockedChapters(root, page) {
   var nums = {}, dom = {}, total = 0, out = {};
-  [].forEach.call(root.querySelectorAll('a[href]'), function (a) {
-    var u = ''; try { u = new URL(a.getAttribute('href'), page).href.replace(/[#?].*$/, ''); } catch (e) { return; }
-    var m = u.replace(/^https?:\/\/[^\/]+/, '').toLowerCase().match(CHNUM); if (!m || !mine(u)) return;
-    var n = String(parseFloat(m[1].replace(/[-_]/, '.')));
+  seriesChapters(root, page).forEach(function (c) {
+    var n = String(c.n);
     if (!nums[n]) { nums[n] = 1; total++; }
-    if (lockOfLink(a)) dom[n] = 0;
+    if (lockOfLink(c.a)) dom[n] = 0;
   });
-  var js = lockJson(root, base);
+  var js = lockJson(root, slugBase(page));
   Object.keys(js.lock).forEach(function (n) { if (!total || nums[n]) out[n] = js.lock[n]; });
   // Fast alles „gesperrt“ nur über Klassen/Symbole: eher ein Fehlalarm (Symbol in jeder Zeile), dann nicht
   var dn = Object.keys(dom).filter(function (n) { return !(n in js.free) && !(n in out); });
   if (!(total > 10 && dn.length > total * 0.6)) dn.forEach(function (n) { out[n] = 0; });
-  var ks = Object.keys(out).sort(function (a, b) { return b - a; }).slice(0, 60), r = {};
-  ks.forEach(function (k) { r[k] = out[k]; });
+  var r = {};
+  Object.keys(out).sort(function (x, y) { return y - x; }).slice(0, 60).forEach(function (k) { r[k] = out[k]; });
   return r;
 }
 // Datensparmodus aus den Lese-Einstellungen (ohne prefs() aus 04-pc, das im Hub-Teil nicht läuft)
@@ -267,9 +274,123 @@ function token(forClipboard) {
   var a = forClipboard ? [] : Object.keys(get(ADD));
   var rr = get('mhub_rate'), r = Object.keys(rr).map(function (k) { return { k: k, r: rr[k].r, t: rr[k].t }; });
   if (!p.length && !c.length && !d.length && !a.length && !r.length) return '';
-  return 'MHUB2:' + btoa(unescape(encodeURIComponent(JSON.stringify({ p: p, c: c, d: d, a: a, r: r, n: n }))));
+  // Selbsttest der Seiten-Profile (klein; nur im Hub, nicht beim Kopieren)
+  var ph = forClipboard ? null : get(P_HEALTH);
+  return 'MHUB2:' + btoa(unescape(encodeURIComponent(JSON.stringify({ p: p, c: c, d: d, a: a, r: r, n: n, ph: ph }))));
 }
 
+/* ---------- Seiten-Profile ----------
+   Ein Profil beschreibt für eine Scan-Seite, wo ihre Daten stehen – nur Selektoren und Texte, kein Code:
+     match            Wörter in der Adresse (wie bei den Scan-Seiten: „asura“ deckt auch eine neue Domain ab)
+     search           Suchadresse, {q} = Titel (Suche auf anderen Seiten)
+     series.title/desc/alt/genres/status   Titel, Beschreibung, Zweitnamen, Genres, Status auf der Serienseite
+     chapters.link/date/lock               Kapitel-Links, Datum in der Zeile, Kennzeichen für bezahlte Kapitel
+     pages.img                             Seitenbilder im Kapitel
+   Jede Angabe ist freiwillig. Was ein Profil nicht sagt oder was dort nichts findet, übernimmt die allgemeine Erkennung
+   wie bisher. Quelle: src/profiles/*.json. Das Skript bringt sie mit; der Hub schickt seine (MHUB-PROFILES), eine höhere
+   Version gewinnt – so lassen sich geänderte Seiten ohne Skript-Update nachziehen. Ob die Profile noch passen, merkt sich
+   das Skript (mhub_phealth) und meldet es mit dem Lesestand an den Hub. Abgeschaltete Seiten: mhub_siteoff. */
+var PROFILES = [{"id":"asura","name":"Asura Scans","v":1,"checked":"2026-10-12","match":["asura"],"search":"/browse?search={q}","series":{"title":"article h1","desc":"#description-text","alt":"#alt-titles","genres":"a[href*='/browse?genres=']"},"chapters":{"link":"a[href*='/chapter/']"}},{"id":"thunder","name":"Thunder Scans","v":1,"checked":"2026-10-12","match":["thunder"],"search":"/?s={q}","series":{"title":"h1.entry-title","desc":".entry-content[itemprop='description']","alt":".alternative, .seriestualt","genres":".mgen a, .seriestugenre a","status":".imptdt"},"chapters":{"link":"#chapterlist li a, .eplister li a","date":".chapterdate","lock":".fa-coins, .fa-lock"},"pages":{"img":"#readerarea img"}},{"id":"vortex","name":"Vortex Scans","v":1,"checked":"2026-10-12","match":["vortex"],"search":"/series/?searchTerm={q}","chapters":{"lock":".paid-chapter-row"}}];
+var P_LIST = 'mhub_profiles', P_OFF = 'mhub_siteoff', P_HEALTH = 'mhub_phealth';
+var pMerged = null, pMergedRaw = null, pDocs = new WeakMap();
+function profiles() {
+  var raw = GM_getValue(P_LIST, '');
+  if (pMerged && raw === pMergedRaw) return pMerged;
+  var byId = {};
+  PROFILES.forEach(function (p) { byId[p.id] = p; });
+  try {
+    (JSON.parse(raw || '[]') || []).forEach(function (p) {
+      if (p && typeof p.id === 'string' && /^[a-z0-9-]{1,40}$/.test(p.id) && Array.isArray(p.match) && (!byId[p.id] || (+p.v || 0) > (+byId[p.id].v || 0))) byId[p.id] = p;
+    });
+  } catch (e) {}
+  pMergedRaw = raw; pMerged = Object.keys(byId).map(function (k) { return byId[k]; });
+  return pMerged;
+}
+function matchWord(host, w) { return !!w && host.indexOf(String(w).toLowerCase()) > -1; }
+function profileFor(url) {
+  var h = hostOf(url || location.href).toLowerCase(), list = profiles();
+  if (!h) return null;
+  for (var i = 0; i < list.length; i++) if (list[i].match.some(function (w) { return matchWord(h, w); })) return list[i];
+  return null;
+}
+// Abgerufene Seiten (DOMParser) kennen ihre Adresse nicht: hier merken, damit das richtige Profil greift
+function bindProfile(doc, url) { if (doc && url && typeof doc === 'object') pDocs.set(doc, url); return doc; }
+function profOf(root) {
+  if (!root) return null;
+  var doc = root.ownerDocument || root, url = doc === document ? location.href : pDocs.get(doc);
+  return url ? profileFor(url) : null;
+}
+// Ein Eintrag des Profils („series.desc“), nur Text
+function pick(p, key) {
+  var v = p;
+  key.split('.').forEach(function (k) { v = v && typeof v === 'object' ? v[k] : undefined; });
+  return typeof v === 'string' ? v : '';
+}
+function pAll(root, sel) { if (!root || !sel) return []; try { return [].slice.call(root.querySelectorAll(sel)); } catch (e) { return []; } }
+// Elemente laut Profil (leer, wenn das Profil dazu nichts sagt oder nichts findet)
+function profEls(root, key) { var p = profOf(root), sel = p && pick(p, key); return sel ? pAll(root, sel) : []; }
+function profEl(root, key) { return profEls(root, key)[0] || null; }
+/* Selbsttest, gemeldet an drei Stellen, die es auf jeder passenden Seite gibt: Titel (altNames), Kapitel-Links
+   (seriesChapters), Kapitelbilder (chapterImgList). Fand das Profil etwas: passt. Fand nur die allgemeine Erkennung
+   etwas: Fehlschlag (fanden beide nichts, z. B. eine Cloudflare-Prüfung oder eine Seite, die noch lädt, zählt es nicht).
+   Ein Fehlschlag zählt einmal pro Seite (die Serienseite wird alle 1,2 s gelesen); nach drei ohne Erfolg dazwischen gilt
+   das Profil als veraltet. Geschrieben wird nur bei einer Änderung oder alle 6 Stunden. */
+var pSeen = {}, pSeenN = 0;
+function profReport(root, key, byProfile, byGeneral) {
+  var p = profOf(root); if (!p || !pick(p, key) || (!byProfile && !byGeneral)) return;
+  var doc = root.ownerDocument || root, tag = p.id + ' ' + key + ' ' + (doc === document ? location.href : pDocs.get(doc));
+  if (!byProfile) { if (pSeen[tag]) return; if (++pSeenN > 500) { pSeen = {}; pSeenN = 0; } pSeen[tag] = 1; }
+  var all = get(P_HEALTH), h = all[p.id] || (all[p.id] = {}), c = h[key] || { ok: 0, bad: 0, n: 0 }, now = Date.now();
+  var n = byProfile ? 0 : c.n + 1;
+  if (n === c.n && now - (byProfile ? c.ok : c.bad) < 6 * 3600e3) return;
+  if (byProfile) c.ok = now; else c.bad = now;
+  c.n = n; c.v = +p.v || 0; h[key] = c; put(P_HEALTH, all);
+}
+// Liste aus dem GM-Speicher (nur Texte; Kaputtes = leer)
+function gmWords(k) { try { var a = JSON.parse(GM_getValue(k, '[]')); return Array.isArray(a) ? a.filter(function (x) { return typeof x === 'string' && x; }) : []; } catch (e) { return []; } }
+// Abgeschaltet (Einstellungen im Hub): Adresse enthält ein abgeschaltetes Wort
+function siteOff(url) { var h = hostOf(url).toLowerCase(); return !h || gmWords(P_OFF).some(function (w) { return matchWord(h, w); }); }
+// Aktive Wörter der Scan-Seiten: mitgebrachte, die der Profile und vom Hub, ohne abgeschaltete
+function siteWords() {
+  var off = gmWords(P_OFF), w = SITES.concat(gmWords('mhub_sites'));
+  profiles().forEach(function (p) { w = w.concat(p.match); });
+  return w.filter(function (x) { return typeof x === 'string' && x && off.indexOf(x) < 0; });
+}
+function siteActive(url) { var h = hostOf(url).toLowerCase(); return !siteOff(url) && siteWords().some(function (w) { return matchWord(h, w); }); }
+/* Kapitel-Links einer Serie auf einer Seite: [{a, n, u}] – Nummer aus der Adresse, nur dieselbe Seite, dieselbe Serie
+   (Name in der Adresse) und dieselbe Art (Roman/Comic). Mit Profil zuerst dessen Kapitel-Links; finden die nichts, alle
+   Links der Seite. Eine Stelle für Serienseite, Funde, Kapitelsuche, Bezahlt-Erkennung und die Karte auf der Serienseite. */
+function seriesChapters(root, page) {
+  var base = slugBase(page), host = hostOf(page), out = [];
+  var take = function (a) {
+    var u = absUrl(a.getAttribute('href'), page), n = chOf(u);
+    if (n == null || hostOf(u) !== host || pathOf(u).toLowerCase().indexOf(base) < 0 || !sameKind(u, page)) return;
+    out.push({ a: a, n: n, u: u });
+  };
+  profEls(root, 'chapters.link').forEach(take);
+  var byProfile = out.length > 0;
+  if (!byProfile) [].forEach.call(root.querySelectorAll('a[href]'), take);
+  profReport(root, 'chapters.link', byProfile, out.length > 0);
+  return out;
+}
+// Zeile eines Kapitel-Links: der Link selbst oder sein Rahmen, solange darin nur dieser eine Link steckt (höchstens 2 Stufen)
+function chapterRow(a) {
+  var row = a;
+  for (var i = 0; i < 2 && row.parentElement && row.parentElement.querySelectorAll('a[href]').length === 1; i++) row = row.parentElement;
+  return row;
+}
+// Datum eines Kapitels: laut Profil in der Zeile, sonst wie bisher am Link und darum herum
+function chapterDate(a) {
+  var p = profOf(a), sel = p && pick(p, 'chapters.date');
+  if (sel) { var d = pAll(chapterRow(a), sel)[0] || pAll(a, sel)[0]; var t = d && (timeAttr(d) || parseDate(textOf(d))); if (t) return t; }
+  return linkDate(a);
+}
+// Bezahlt-Kennzeichen laut Profil (Selektor trifft die Zeile oder etwas darin); null = Profil sagt nichts
+function profLocked(a) {
+  var p = profOf(a), sel = p && pick(p, 'chapters.lock'); if (!sel) return null;
+  var row = chapterRow(a);
+  try { return row.matches(sel) || a.matches(sel) || !!row.querySelector(sel); } catch (e) { return null; }
+}
 /* ---------- Im Hub ---------- */
 if (isHub || topMode) {
   var send = function () { var t = token(false); if (t) post(t); };
@@ -303,9 +424,8 @@ if (isHub || topMode) {
   // Bezahlte Kapitel auf einer abgerufenen Serienseite (nur wenn der Text überhaupt danach aussieht: spart das Zerlegen)
   var lockOfPage = function (t, page) {
     if (!/premium|locked|lock|coin|paid|accessible|early_?access/i.test(t)) return {};
-    var doc = null; try { doc = new DOMParser().parseFromString(t, 'text/html'); } catch (e) { return {}; }
-    var base = slugBase(page);
-    return lockedChapters(doc, page, function (u) { return pathOf(u).toLowerCase().indexOf(base) > -1 && sameKind(u, page); }, base);
+    var doc = null; try { doc = bindProfile(new DOMParser().parseFromString(t, 'text/html'), page); } catch (e) { return {}; }
+    return lockedChapters(doc, page);
   };
   var checkOne = function (j, cb) {
     var sp = seriesPage(j.tpl), pt = pattern(j.tpl), urls = [sp, j.latest].filter(Boolean), i = 0;
@@ -361,28 +481,27 @@ if (isHub || topMode) {
   };
   // Kapitel-Links einer Serienseite: Links (und Adressen im Seitentext) mit Kapitelnummer, die zur Serie gehören
   var chaptersOf = function (html, page) {
-    var doc = new DOMParser().parseFromString(html, 'text/html'), host = hostOfU(page), ppath = new URL(page).pathname.replace(/\/$/, '');
-    var slug = ppath.split('/').pop().toLowerCase().replace(/-[a-z0-9]{8}$/, function (m) { return /\d/.test(m) ? '' : m; });
-    var found = {}, add = function (u) {
-      if (!u || hostOfU(u) !== host) return;
-      var p = new URL(u).pathname.toLowerCase(), m = p.match(CHN);
-      if (!m || (p.indexOf(ppath.toLowerCase() + '/') !== 0 && p.indexOf(slug) < 0)) return;
-      var n = parseFloat(m[1].replace(/[-_]/, '.'));
-      if (!isNaN(n) && n < 100000 && !found[n]) found[n] = u;
-    };
-    [].forEach.call(doc.querySelectorAll('a[href]'), function (a) { add(absU(a.getAttribute('href'), page)); });
+    var doc = bindProfile(new DOMParser().parseFromString(html, 'text/html'), page), host = hostOfU(page), base = slugBase(page), found = {};
+    seriesChapters(doc, page).forEach(function (c) { if (c.n < 100000 && !found[c.n]) found[c.n] = c.u; });
+    // Seiten, die die Liste erst im Browser zeichnen: Kapitel-Adressen im Seitentext (Next.js-Daten)
     var t = html.replace(/\\+\//g, '/'), re = /(?:https?:\/\/[^"'\s<>\\]+)?\/[^"'\s<>\\]*(?:chapter|chap|ch|episode|ep)[-_\/ .]?\d+(?:[-_.]\d+)?\/?/gi, m;
-    while ((m = re.exec(t))) add(absU(m[0], page));
+    while ((m = re.exec(t))) {
+      var u = absU(m[0], page), n = u && hostOfU(u) === host && pathOf(u).toLowerCase().indexOf(base) > -1 && sameKind(u, page) ? chOf(u) : null;
+      if (n != null && n < 100000 && !found[n]) found[n] = u;
+    }
     return Object.keys(found).map(function (n) { return [+n, found[n]]; }).sort(function (a, b) { return a[0] - b[0]; });
   };
   var findOn = function (titles, site, cb) {
-    var q = encodeURIComponent(titles[0]), urls = [site.origin + '/?s=' + q, site.origin + '/series?name=' + q, site.origin + '/search?q=' + q], i = 0;
+    // Suchadresse laut Profil zuerst, dann die üblichen
+    var q = encodeURIComponent(titles[0]), p = profileFor(site.origin), tpl = p && pick(p, 'search'), i = 0;
+    var urls = (tpl ? [site.origin + tpl.split('{q}').join(q)] : []).concat([site.origin + '/?s=' + q, site.origin + '/series?name=' + q, site.origin + '/search?q=' + q])
+      .filter(function (u, k, a) { return a.indexOf(u) === k; });
     (function step() {
       if (i >= urls.length) return cb(null);
       var su = urls[i++];
       fetchText(su, function (html) {
         if (!html) return step();
-        var hits = seriesHits(new DOMParser().parseFromString(html, 'text/html'), su, site.host), best = null;
+        var hits = seriesHits(bindProfile(new DOMParser().parseFromString(html, 'text/html'), su), su, site.host), best = null;
         Object.keys(hits).forEach(function (u) {
           var sc = 0, slugName = u.split('/').pop().replace(/-[a-z0-9]{8}$/, '').replace(/[-_]+/g, ' ');
           hits[u].concat([slugName]).forEach(function (nm) { titles.forEach(function (t) { sc = Math.max(sc, titleScore(nm, t)); }); });
@@ -435,6 +554,7 @@ if (isHub || topMode) {
     (function next() {
       if (i >= o.sites.length) { post('MHUB-FINDEND:' + JSON.stringify({ id: o.id, found: found })); return; }
       var site = o.sites[i++];
+      if (!site || typeof site.origin !== 'string' || siteOff(site.origin)) return next();
       findOn(o.titles, site, function (r) {
         if (r) { found++; post('MHUB-SRCFOUND:' + JSON.stringify({ id: o.id, host: site.host, page: r.page, title: r.title, ch: r.ch, lk: r.lk || null })); }
         setTimeout(next, 700);
@@ -445,11 +565,7 @@ if (isHub || topMode) {
      bekannten Scan-Seiten. Bilder, die der Hub nicht direkt laden darf, holt das Skript mit der Kapitelseite als Referer
      (MHUB-IMGDATA → MHUB-IMGDATAOK als data-URL), aber nur Bilder, die vorher eine Kapitelseite geliefert hat. */
   var readImgs = {}, readN = 0;
-  var siteOk = function (u) {
-    var h = hostOf(u), w = SITES.slice();
-    try { w = w.concat(JSON.parse(GM_getValue('mhub_sites', '[]')) || []); } catch (e) {}
-    return /^https?:\/\//.test(u) && !!h && w.some(function (x) { return x && h.indexOf(String(x).toLowerCase()) >= 0; });
-  };
+  var siteOk = function (u) { return /^https?:\/\//.test(u) && siteActive(u); };
   var readChapter = function (o) {
     if (!o || typeof o.url !== 'string') return;
     var fin = function (imgs, title) { post('MHUB-READOK:' + JSON.stringify({ id: o.id, url: o.url, imgs: imgs, title: title || '' })); };
@@ -488,6 +604,9 @@ if (isHub || topMode) {
     else if (d.indexOf('MHUB-LANG:') === 0) GM_setValue('mhub_lang', d.slice(10) === 'en' ? 'en' : 'de');
     else if (d.indexOf('MHUB-PREFS:') === 0) GM_setValue('mhub_prefs', d.slice(11));
     else if (d === 'MHUB-RELOAD' && topMode) location.reload();
+    else if (d.indexOf('MHUB-PROFILES:') === 0) {
+      try { var po = JSON.parse(d.slice(14)); if (Array.isArray(po.list)) GM_setValue(P_LIST, JSON.stringify(po.list)); if (Array.isArray(po.off)) GM_setValue(P_OFF, JSON.stringify(po.off)); } catch (err) {}
+    }
     else if (d.indexOf('MHUB-SITES:') === 0) {
       try { var list = JSON.parse(d.slice(11)); if (Array.isArray(list)) GM_setValue('mhub_sites', JSON.stringify(list)); } catch (err) {}
       post('MHUB-SITES-OK');
@@ -553,8 +672,8 @@ if (isHub || topMode) {
 
 /* ---------- Auf den Scan-Seiten ---------- */
 if (window.top !== window.self) return;
-try { SITES = SITES.concat(JSON.parse(GM_getValue('mhub_sites', '[]')) || []); } catch (e) {}
-if (!SITES.some(function (s) { return s && location.hostname.indexOf(s) > -1; })) return;
+// Nur auf eingeschalteten Scan-Seiten (Wörter vom Hub, ohne die in den Einstellungen abgeschalteten)
+if (!siteActive(location.href)) return;
 var path = '', cur = 0, box = null, imgCount = -1, dirty = false, lastWrite = 0, flashUntil = 0, queued = false, restoring = false, touched = false;
 var bigImgs = [], curA = null, REF = 0.3;
 var savedT = 0, savedA = null;
@@ -1747,22 +1866,18 @@ function enrich(c, cb) {
     onerror: function () { cb(null); }, ontimeout: function () { cb(null); } });
 }
 function fromDoc(c, doc, cb) {
-  var base = slugBase(c.url);
-  var og = doc && doc.querySelector('meta[property="og:image"]'), ot = doc && doc.querySelector('meta[property="og:title"]');
-  var e = { title: ogName(ot && ot.content) || c.title, rating: c.rating, ch: c.ch, chUrl: c.chUrl, img: '', site: hostOf(c.url) || location.hostname, t: Date.now(), feat: c.feat ? Date.now() : 0,
+  bindProfile(doc, c.url);
+  var og = doc && doc.querySelector('meta[property="og:image"]'), ot = doc && doc.querySelector('meta[property="og:title"]'), pt = doc && profEl(doc, 'series.title');
+  var e = { title: (pt && textOf(pt)) || ogName(ot && ot.content) || c.title, rating: c.rating, ch: c.ch, chUrl: c.chUrl, img: '', site: hostOf(c.url) || location.hostname, t: Date.now(), feat: c.feat ? Date.now() : 0,
     g: [], desc: '', type: c.type || '', rel: [] };
   if (doc) {
     var seen = {}, rel = {};
+    seriesChapters(doc, c.url).forEach(function (k) {
+      if (e.ch == null || k.n > e.ch) { e.ch = k.n; e.chUrl = k.u; }
+      var dt = chapterDate(k.a); if (dt && !rel[k.n]) rel[k.n] = dt;
+    });
     doc.querySelectorAll('a[href]').forEach(function (a) {
       var hrf = (a.getAttribute('href') || '').toLowerCase();
-      var u = absUrl(a.getAttribute('href'), c.url), n = chOf(u);
-      if (n != null && pathOf(u).toLowerCase().indexOf(base) > -1) {
-        if (!sameKind(u, c.url)) return;
-        if (e.ch == null || n > e.ch) { e.ch = n; e.chUrl = u; }
-        var dt = linkDate(a);
-        if (dt && !rel[n]) rel[n] = dt;
-        return;
-      }
       if (/(genre|genres|tag|tags)[\/=]/.test(hrf) && !a.closest('nav,header,footer,[class*="menu"],[id*="menu"]')) {
         var t = (a.textContent || '').replace(/\s+/g, ' ').trim();
         if (t && t.length < 30 && !seen[t.toLowerCase()] && e.g.length < 12) { seen[t.toLowerCase()] = 1; e.g.push(t); }
@@ -1783,7 +1898,7 @@ function fromDoc(c, doc, cb) {
     e.ss = siteStatus(doc) || jsonStatus(doc);
     e.alt = altNames(doc);
     // Bezahlte Kapitel (vollständige Sicht der Serienseite: ersetzt im Hub, was vorher bekannt war)
-    e.lk = lockedChapters(doc, c.url, function (u) { return pathOf(u).toLowerCase().indexOf(base) > -1 && sameKind(u, c.url); }, base); e.lkt = Date.now();
+    e.lk = lockedChapters(doc, c.url); e.lkt = Date.now();
   }
   else if (c.lk) { e.lk = c.lk; e.lkp = 1; e.lkt = Date.now(); }
   // 400 px breit: scharf in der Entdecken-Liste auch bei hoher Pixeldichte; hervorgehobene (fürs Karussell) 600 px.
@@ -1859,12 +1974,10 @@ var relDoneFor = '', relPath = '', relSince = 0;
 function refreshRel() {
   if (relDoneFor === path || isChapter() || !SERIES.test(path)) return;
   if (relPath !== path) { relPath = path; relSince = Date.now(); }
-  var self = canonUrl((location.origin + path).replace(/\/$/, '')), base = slugBase(self), rel = {}, mx = null, mxU = null;
-  document.querySelectorAll('a[href]').forEach(function (a) {
-    var u = absUrl(a.getAttribute('href')), n = chOf(u);
-    if (n == null || pathOf(u).toLowerCase().indexOf(base) < 0 || !sameKind(u, self)) return;
-    if (mx == null || n > mx) { mx = n; mxU = u; }
-    var dt = linkDate(a); if (dt && !rel[n]) rel[n] = dt;
+  var self = canonUrl((location.origin + path).replace(/\/$/, '')), rel = {}, mx = null, mxU = null;
+  seriesChapters(document, self).forEach(function (k) {
+    if (mx == null || k.n > mx) { mx = k.n; mxU = k.u; }
+    var dt = chapterDate(k.a); if (dt && !rel[k.n]) rel[k.n] = dt;
   });
   // Ohne Kapitel-Links erst, wenn die Seite fertig geladen sein dürfte (Seiten, die Inhalte nachladen)
   if (mx == null && Date.now() - relSince < 6000) return;
@@ -1875,7 +1988,7 @@ function refreshRel() {
   relDoneFor = path;
   var list = Object.keys(rel).map(function (n) { return [parseFloat(n), rel[n]]; }).sort(function (a, b) { return a[0] - b[0]; }).slice(-20);
   var desc = fullDesc(document), hg = headGenres(document), ss = siteStatus(document) || jsonStatus(document), alt = altNames(document);
-  var lk = lockedChapters(document, self, function (u) { return pathOf(u).toLowerCase().indexOf(base) > -1 && sameKind(u, self); }, base);
+  var lk = lockedChapters(document, self);
   if (!hg.length && !(e.g && e.g.length)) hg = jsonGenres(document);
   var sig = JSON.stringify([list, mx, desc.length, hg, ss, alt, lk]);
   var light = !e.desc && !(e.g && e.g.length), noImg = !e.q && !saveMode();
@@ -2239,8 +2352,9 @@ function descTrim(t) {
 }
 function fullDesc(root) {
   var meta = metaDesc(root);
-  var probe = normT(meta.replace(/(\.\.\.|…)\s*$/, '')).slice(0, 60), best = null, bl = 1e9, bestCut = true;
-  if (probe.length >= 20) {
+  // Laut Profil steht die Beschreibung hier; sonst das Element suchen, das den Anfang der Meta-Beschreibung enthält
+  var probe = normT(meta.replace(/(\.\.\.|…)\s*$/, '')).slice(0, 60), best = profEl(root, 'series.desc'), bl = 1e9, bestCut = true;
+  if (!best && probe.length >= 20) {
     root.querySelectorAll('p,div,span,section,article').forEach(function (el) {
       if (el.closest('head,script,style,noscript,template')) return;
       var t = normT(el.textContent); if (t.length < probe.length || t.length > 8000 || t.indexOf(probe) < 0) return;
@@ -2289,7 +2403,11 @@ function fullDesc(root) {
 /* Alternative Namen der Serie: Asura zeigt sie unter dem Titel, getrennt mit „•“; andere Seiten unter einer Beschriftung
    wie „Alternative“, „Associated Names“, „Other names“ oder in einem Element mit „alternative“ in der Klasse. */
 function altNames(root) {
-  var h1 = root.querySelector('h1'), title = h1 ? normT(h1.textContent) : '', raw = [], comma = false;
+  var pt = profEl(root, 'series.title'), h1 = pt || root.querySelector('h1'), title = h1 ? normT(h1.textContent) : '', raw = [], comma = false;
+  profReport(root, 'series.title', !!pt, !!h1);
+  // 0. Laut Profil (dann entfallen die Suchschritte unten, sie prüfen alle zuerst raw). Ein eigenes Feld nur für Namen:
+  //    wie bei einer Beschriftung auch mit Komma getrennt, wenn kein anderes Trennzeichen vorkommt
+  var pa = profEl(root, 'series.alt'); if (pa && (pa.textContent || '').length < 700) { raw.push(pa.textContent || ''); comma = true; }
   // 1. Beschriftung „Alternative: …“ (Wert im selben Element oder im nächsten)
   root.querySelectorAll('h1,h2,h3,h4,h5,h6,span,div,b,strong,dt,th,td,p,label,li').forEach(function (el) {
     if (raw.length || el.childElementCount > 3) return;
@@ -2304,7 +2422,6 @@ function altNames(root) {
   });
   // 2. Element mit „alternative“/„alt-name“ in der Klasse
   if (!raw.length) { var c = root.querySelector('[class*="alternative"],[class*="alt-name"],[class*="altname"],[class*="alt_title"]'); if (c && (c.textContent || '').length < 700) raw.push((c.textContent || '').replace(ALT_LABEL, '')); }
-  // 3. Zeile direkt unter dem Titel mit mehreren durch • getrennten Namen (Asura)
   // 3. Zeile direkt über oder unter dem Titel mit mehreren Namen: mit „•“ getrennt (Asura) oder mit Komma (Vortex: über dem
   //    Titel „대마법사 커리큘럼, The Archmage Curriculum“). Nur, wenn es nach Namen aussieht: jeder Teil kurz, nicht klein
   //    anfangend, kein Satz (kein Fließtext)
@@ -2365,7 +2482,13 @@ function altNames(root) {
 }
 // Genres unter einer Überschrift „Genres“/„Tags“, z. B. als Knöpfe (Asura)
 function headGenres(root) {
-  var out = [];
+  var out = [], seen0 = {};
+  // Laut Profil: die Genre-Links/-Knöpfe (doppelte, z. B. für Handy und PC, nur einmal)
+  profEls(root, 'series.genres').forEach(function (el) {
+    var t = (el.textContent || '').replace(/\s+/g, ' ').trim().replace(/,$/, '');
+    if (t.length >= 2 && t.length <= 30 && !seen0[t.toLowerCase()]) { seen0[t.toLowerCase()] = 1; out.push(t); }
+  });
+  if (out.length) return out.slice(0, 20);
   root.querySelectorAll('h1,h2,h3,h4,h5,h6,span,div,p,b,strong,dt,label').forEach(function (h) {
     if (out.length || h.children.length) return;
     var ht = (h.textContent || '').trim().toLowerCase().replace(/[:\s]+$/, '');
@@ -2393,6 +2516,12 @@ function mergeGenres(a, b) {
 function siteStatus(root) {
   // Text mit Leerzeichen zwischen den Teilen, sonst wird aus „Status“ + „Completed“ ein Wort
   var spaced = function (el) { var w = el.ownerDocument.createTreeWalker(el, 4), out = [], n; while ((n = w.nextNode())) out.push(n.nodeValue); return out.join(' ').replace(/\s+/g, ' ').trim(); };
+  // Laut Profil: im Status-Element nur noch das Wort suchen
+  var ps = profEls(root, 'series.status');
+  for (var j = 0; j < ps.length; j++) {
+    var pv = spaced(ps[j]).replace(/^(?:status|stand)\s*:?\s*/i, '').slice(0, 60);
+    for (var q = 0; q < STATUS_WORDS.length; q++) if (STATUS_WORDS[q][0].test(pv)) return STATUS_WORDS[q][1];
+  }
   var els = root.querySelectorAll('h1,h2,h3,h4,h5,h6,span,div,dt,th,td,b,strong,p,label,li');
   for (var i = 0; i < els.length; i++) {
     var el = els[i]; if (el.childElementCount > 3) continue;
@@ -2429,15 +2558,6 @@ function seriesState(e, base) {
   else if (st.n == null || st.n <= st.r) st.n = st.r + 1 <= (e.m || 0) ? Math.floor(st.r) + 1 : null;
   return st;
 }
-// Kapitel-Links dieser Serie auf der Seite
-function chapLinks(base) {
-  var out = [];
-  document.querySelectorAll('a[href]').forEach(function (a) {
-    var u = absUrl(a.getAttribute('href')), n = chOf(u);
-    if (n != null && pathOf(u).toLowerCase().indexOf(base) > -1 && sameKind(u, location.href) && new URL(u).hostname === location.hostname) out.push({ a: a, n: n, u: u });
-  });
-  return out;
-}
 function cardBtn(label, fn, main) {
   var b = document.createElement('div');
   b.setAttribute('role', 'button'); b.textContent = label;
@@ -2448,12 +2568,12 @@ function cardBtn(label, fn, main) {
 function seriesCard() {
   if (isChapter() || !SERIES.test(path)) { if (card) { card.remove(); card = null; } return; }
   var self = canonUrl((location.origin + path).replace(/\/$/, '')), base = slugBase(self), key = novelKey(base.replace(/[^a-z0-9]/g, ''), path);
-  var e = libEntry(key), links = chapLinks(base), st = e ? seriesState(e, base) : null;
+  var e = libEntry(key), links = seriesChapters(document, self), st = e ? seriesState(e, base) : null;
   // Kapitelliste: gelesene abdunkeln, aktuelles gelb umranden
   links.forEach(function (x) {
     var mode = !st ? '' : (st.c && x.n === st.c.n ? 'c' : (x.n <= st.r ? 'r' : ''));
-    if (x.a.getAttribute('data-mhub') === mode) return;
-    x.a.setAttribute('data-mhub', mode);
+    if (x.a.getAttribute('data-mhub-read') === mode) return;
+    x.a.setAttribute('data-mhub-read', mode);
     x.a.style.opacity = mode === 'r' ? '0.45' : '';
     // Umrandung aufs innere Element, wenn der Link selbst nur eine Textzeile ist
     var box = (getComputedStyle(x.a).display === 'inline' && x.a.firstElementChild) || x.a;
