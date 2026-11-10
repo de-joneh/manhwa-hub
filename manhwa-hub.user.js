@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.53.0
+// @version      3.53.1
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var hubMark = !!document.querySelector('[data-mhub]'), isHub = false;
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.53.0';
+var VERSION = '3.53.1';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -1330,15 +1330,28 @@ function hint(dx, tg) {
   swHint.style.opacity = String(Math.min(1, Math.abs(dx) / (W * 0.2)));
   swHint.style.display = 'block';
 }
+// Reingezoomt (Zwei-Finger-Zoom): Wischen verschiebt den Ausschnitt, nicht das Kapitel.
+// Maßstab = kleinster je gesehener Zoom, weil manche Seiten nicht bei genau 1 starten.
+var zoomBase = (window.visualViewport && window.visualViewport.scale) || 1, multiT = 0;
+if (window.visualViewport) window.visualViewport.addEventListener('resize', function () { var s = window.visualViewport.scale; if (s && s < zoomBase) zoomBase = s; });
+function zoomedIn() {
+  var vv = window.visualViewport;
+  if (vv && vv.scale) return vv.scale > zoomBase * 1.04;
+  var cw = document.documentElement.clientWidth;
+  return cw && window.innerWidth && cw / window.innerWidth > 1.04;
+}
 window.addEventListener('touchstart', function (e) {
   sw0 = null;
-  if (!reader || !isChapter() || e.touches.length !== 1 || !prefs().swipe || preparing) return;
+  if (e.touches.length > 1) multiT = Date.now();
+  // Gerade noch gezoomt (Finger kommt nach dem Zoomen zurück): kurz kein Kapitelwechsel
+  if (!reader || !isChapter() || e.touches.length !== 1 || !prefs().swipe || preparing || zoomedIn() || Date.now() - multiT < 400) return;
   if (e.target && e.target.closest && e.target.closest('#mhub-ask')) return;
   var t = e.touches[0]; sw0 = { x: t.clientX, y: t.clientY, dx: 0, h: null };
 }, { passive: true, capture: true });
 window.addEventListener('touchmove', function (e) {
+  if (e.touches.length > 1) multiT = Date.now();
   if (!sw0) return;
-  if (e.touches.length !== 1) { sw0 = null; moveReader(0, 150); dropPeek(); if (swHint) swHint.style.display = 'none'; return; }
+  if (e.touches.length !== 1 || zoomedIn()) { sw0 = null; moveReader(0, 150); dropPeek(); if (swHint) swHint.style.display = 'none'; return; }
   var t = e.touches[0], dx = t.clientX - sw0.x, dy = t.clientY - sw0.y;
   if (sw0.h === null) {
     if (Math.abs(dx) > 14 && Math.abs(dx) > Math.abs(dy) * 1.5) { sw0.h = true; sw0.tg = chapterTargets() || {}; sw0.x = t.clientX; dx = 0; }
