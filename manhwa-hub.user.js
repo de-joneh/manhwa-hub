@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.53.1
+// @version      3.54.0
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,13 +23,14 @@ var hubMark = !!document.querySelector('[data-mhub]'), isHub = false;
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.53.1';
+var VERSION = '3.54.0';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
 var SERIES = /\/(?:series|manga|manhwa|manhua|comics?|title|webtoon|novels?)\/[^\/]+\/?$/;
 // Cover: Zielgröße und Qualitätsstufe (ältere Stufen werden einmal neu geholt). Hier oben, weil auch der Hub-Teil sie braucht
-var COVER_W = 600, COVER_H = 800, COVER_Q = 2;
+// COVER_Q 3 (ab 3.54): Bild auf Hochformat geprüft (vorher konnte die Teilen-Karte der Seite als Cover landen)
+var COVER_W = 600, COVER_H = 800, COVER_Q = 3;
 var LOG = 'mhub_log', COV = 'mhub_cov', DISC = 'mhub_disc', LIB = 'mhub_lib', ADD = 'mhub_add';
 /* Konstanten, die auch der Hub-Teil (01-hub) braucht: Er endet mit return, bevor die übrigen Dateien ihre var-Zeilen
    ausführen. Funktionen sind dort überall nutzbar (hoisting), Variablen nur, wenn sie hier oben stehen. */
@@ -209,9 +210,28 @@ function slugOfPath(p) {
 // Schlüssel aus dem Namen der Adresse, für Romane mit „novel“ am Ende
 function novelKey(key, p) { return key && /\/novels?\//i.test(p || '') && !/novel$/.test(key) ? key + 'novel' : key; }
 function isNovelUrl(u) { return /\/novels?\//i.test(u || '') || /-novel(?:[\/?#]|-(?:chapter|ch|episode|ep)\b|$)/i.test(u || ''); }
+/* Roman-Serie? Die Adresse allein reicht nicht immer: Ein Comic kann „… Internet Novel“ heißen (Adresse endet dann auch auf
+   „-novel“, ist aber kein Roman), und manche Romane stehen ohne „-novel“ in der Adresse, nur mit „[Novel]“ im Titel (Thunder).
+   Sicher: /novels/ im Pfad oder ein Zusatz in Klammern im Titel. „-novel“ am Ende der Adresse zählt nur, wenn der Name
+   selbst nicht auf „Novel“ endet. */
+// Art-Abzeichen (badgeType in 09; hier oben, weil auch der Hub-Teil Funde anreichert)
+var TYPE_W = /^(manhwa|manga|manhua|novel|webtoon)$/;
+var NOVEL_MARK = /[\(\[]\s*(?:(?:light |web )?novels?|소설|小説|小说)\s*[\)\]]/i;
+function novelName(t) { return /novel$/.test(String(t || '').replace(NOVEL_MARK, '').toLowerCase().replace(/[^a-z0-9]+/g, '')); }
+function isNovelPage(u, title) {
+  if (/\/novels?\//i.test(u || '') || NOVEL_MARK.test(title || '')) return true;
+  return isNovelUrl(u) && !novelName(title);
+}
+// Titel einer (abgerufenen oder offenen) Seite sagt „[Novel]“: Überschrift, og:title oder <title>
+function docNovel(root) {
+  var d = root && (root.nodeType === 9 ? root : root.ownerDocument); if (!d || !d.querySelector) return false;
+  var h = d.querySelector('h1'), og = d.querySelector('meta[property="og:title"]');
+  return NOVEL_MARK.test(h ? h.textContent || '' : '') || NOVEL_MARK.test(og ? og.content || '' : '') || NOVEL_MARK.test(d.title || '');
+}
 // Kapitel-Link derselben Art wie die Serie: Comic-Seiten verlinken oft den Roman („Read the Novel“ → /novels/…/chapter/211,
 // Thunder: …-novel-chapter-317) und umgekehrt. Mit gleichem Namen in der Adresse fielen diese Kapitel sonst in die falsche Serie
-function sameKind(u, ref) { return isNovelUrl(u) === isNovelUrl(ref); }
+// nov: die Seite ist laut Titel ein Roman, auch wenn es die Adresse nicht zeigt (Thunder: Serie ohne, Kapitel mit „-novel“)
+function sameKind(u, ref, nov) { var k = isNovelUrl(u); return k === isNovelUrl(ref) || (!!nov && k); }
 function seriesKeyOf(u) {
   var p = ''; try { p = new URL(u).pathname; try { p = decodeURIComponent(p); } catch (e) {} } catch (e) { return ''; }
   return slugOfPath(p.toLowerCase()).replace(/[^a-z0-9]/g, '');
@@ -335,6 +355,8 @@ function profileFor(url) {
 }
 // Abgerufene Seiten (DOMParser) kennen ihre Adresse nicht: hier merken, damit das richtige Profil greift
 function bindProfile(doc, url) { if (doc && url && typeof doc === 'object') pDocs.set(doc, url); return doc; }
+// Adresse der Seite, zu der ein Element gehört (offene Seite oder abgerufenes Dokument)
+function docUrl(root) { var doc = root && (root.ownerDocument || root); return !doc ? '' : doc === document ? location.href : pDocs.get(doc) || ''; }
 function profOf(root) {
   if (!root) return null;
   var doc = root.ownerDocument || root, url = doc === document ? location.href : pDocs.get(doc);
@@ -380,10 +402,10 @@ function siteActive(url) { var h = hostOf(url).toLowerCase(); return !siteOff(ur
    Links der Seite. Eine Stelle für Serienseite, Funde, Kapitelsuche, Bezahlt-Erkennung und die Karte auf der Serienseite.
    generic: ohne Profil (zum Einlernen). */
 function seriesChapters(root, page, generic) {
-  var base = slugBase(page), host = hostOf(page), out = [];
+  var base = slugBase(page), host = hostOf(page), out = [], nov = docNovel(root);
   var take = function (a) {
     var u = absUrl(a.getAttribute('href'), page), n = chOf(u);
-    if (n == null || hostOf(u) !== host || !slugIn(u, base) || !sameKind(u, page)) return;
+    if (n == null || hostOf(u) !== host || !slugIn(u, base) || !sameKind(u, page, nov)) return;
     out.push({ a: a, n: n, u: u });
   };
   if (!generic) profEls(root, 'chapters.link').forEach(take);
@@ -500,12 +522,12 @@ if (isHub || topMode) {
   };
   // Kapitel-Links einer Serienseite: Links (und Adressen im Seitentext) mit Kapitelnummer, die zur Serie gehören
   var chaptersOf = function (html, page) {
-    var doc = bindProfile(new DOMParser().parseFromString(html, 'text/html'), page), host = hostOfU(page), base = slugBase(page), found = {};
+    var doc = bindProfile(new DOMParser().parseFromString(html, 'text/html'), page), host = hostOfU(page), base = slugBase(page), found = {}, nov = docNovel(doc);
     seriesChapters(doc, page).forEach(function (c) { if (c.n < 100000 && !found[c.n]) found[c.n] = c.u; });
     // Seiten, die die Liste erst im Browser zeichnen: Kapitel-Adressen im Seitentext (Next.js-Daten)
     var t = html.replace(/\\+\//g, '/'), re = /(?:https?:\/\/[^"'\s<>\\]+)?\/[^"'\s<>\\]*(?:chapter|chap|ch|episode|ep)[-_\/ .]?\d+(?:[-_.]\d+)?\/?/gi, m;
     while ((m = re.exec(t))) {
-      var u = absU(m[0], page), n = u && hostOfU(u) === host && slugIn(u, base) && sameKind(u, page) ? chOf(u) : null;
+      var u = absU(m[0], page), n = u && hostOfU(u) === host && slugIn(u, base) && sameKind(u, page, nov) ? chOf(u) : null;
       if (n != null && n < 100000 && !found[n]) found[n] = u;
     }
     return Object.keys(found).map(function (n) { return [+n, found[n]]; }).sort(function (a, b) { return a[0] - b[0]; });
@@ -534,8 +556,8 @@ if (isHub || topMode) {
       });
     })();
   };
-  // Cover neu holen (MHUB-COVERS: [{id, page, w}]): Bild der Serienseite in passender Größe (docCoverUrl).
-  // Funde (w gesetzt): dq = Stufe im Hub, 3 = beste Quelle, 4 = groß (600 px, fürs Karussell)
+  // Cover neu holen (MHUB-COVERS: [{id, page, w, iu}]): Bild der Serienseite in passender Größe (docCoverList).
+  // Funde (w gesetzt): dq = Stufe im Hub
   var runCovers = function (jobs) {
     if (!Array.isArray(jobs)) return;
     var i = 0;
@@ -544,11 +566,11 @@ if (isHub || topMode) {
       var j = jobs[i++];
       fetchText(j.page, function (html) {
         var doc = null; try { doc = html ? new DOMParser().parseFromString(html, 'text/html') : null; } catch (e) {}
-        var ot = doc && doc.querySelector('meta[property="og:title"]');
-        var og = doc && doc.querySelector('meta[property="og:image"],meta[name="twitter:image"]'), ogU = '';
-        try { ogU = og && og.content ? new URL(og.content, j.page).href : ''; } catch (e) {}
-        var us = (doc ? [docCoverUrl(doc, j.page, Math.round((j.w || COVER_W) * 1.5), ot && ot.content), ogU].concat(docMoreCovers(doc, j.page)) : []).concat(j.iu ? [j.iu] : []), desc = doc ? fullDesc(doc) : '';
-        var done = function (img, w) { post('MHUB-COVEROK:' + JSON.stringify({ id: j.id, img: img || '', q: COVER_Q, dq: j.w >= 600 && w >= 570 ? 4 : 3, desc: desc })); setTimeout(next, 1200); };
+        if (doc) bindProfile(doc, j.page);
+        var ot = doc && doc.querySelector('meta[property="og:title"]'), pt = doc && profEl(doc, 'series.title');
+        var us = doc ? docCoverList(doc, j.page, Math.round((j.w || COVER_W) * 1.5), (pt && textOf(pt)) || ogName(ot && ot.content), [j.iu]) : [j.iu], desc = doc ? fullDesc(doc) : '';
+        // dq: Stufe im Hub. Ab 3.54 sind die Bilder auf Hochformat geprüft: 13 = beste Quelle, 14 = groß (vorher 3/4)
+        var done = function (img, w) { post('MHUB-COVEROK:' + JSON.stringify({ id: j.id, img: img || '', q: COVER_Q, dq: j.w >= 600 && w >= 570 ? 14 : 13, desc: desc })); setTimeout(next, 1200); };
         shrinkAny(us, done, j.w, j.page);
       });
     })();
@@ -656,7 +678,7 @@ if (isHub || topMode) {
     else if (d.indexOf('MHUB-READ:') === 0) { try { readChapter(JSON.parse(d.slice(10))); } catch (err) {} }
     else if (d.indexOf('MHUB-IMGDATA:') === 0) { try { imgData(JSON.parse(d.slice(13))); } catch (err) {} }
     else if (d.indexOf('MHUB-IMG:') === 0) {
-      try { var o = JSON.parse(d.slice(9)); shrink(o.url, function (img) { post('MHUB-IMGOK:' + JSON.stringify({ id: o.id, img: img })); }); } catch (err) {}
+      try { var o = JSON.parse(d.slice(9)); shrink(o.url, function (img) { post('MHUB-IMGOK:' + JSON.stringify({ id: o.id, img: img })); }, undefined, undefined, true); } catch (err) {}
     }
   });
   if (GM_addValueChangeListener) {
@@ -1683,49 +1705,134 @@ function coverData(bmp, maxW) {
   }
   return d;
 }
-// maxW: kleinere Vorschau (Entdecken). cb(Bild, Breite des Ergebnisses)
+/* Form eines Bildes als Cover: 2 = Hochformat (so sieht ein Cover aus), 1 = fast quadratisch (nur, wenn es nichts
+   Besseres gibt), 0 = Querformat. Quer ist die Vorschau-Karte fürs Teilen (og:image als Bild mit Titel, Wertung und Text,
+   meist 1200×630 – Asura und Vortex liefern so eins) oder ein Banner. Zugeschnitten sah man davon nur ein Stück Text. */
+function coverShape(w, h) { if (!w || !h || w > h * 1.25) return 0; return w <= h * 0.95 ? 2 : 1; }
+// maxW: kleinere Vorschau (Entdecken). cb(Bild, Breite des Ergebnisses, Form, Breite des Originals)
 // ref: Seite, von der das Bild stammt (manche Seiten liefern Bilder nur mit passendem Referer)
-function shrink(src, cb, maxW, ref) {
+// any: jedes Format nehmen (ein Bild, das du selbst als Cover gewählt hast)
+function shrink(src, cb, maxW, ref, any) {
   GM_xmlhttpRequest({ method: 'GET', url: src, responseType: 'blob', timeout: 15000, headers: ref ? { Referer: ref } : undefined,
     onload: function (res) {
-      if (res.status !== 200 || !res.response) return cb('', 0);
-      createImageBitmap(res.response).then(function (bmp) { cb(coverData(bmp, maxW), Math.min(maxW || COVER_W, bmp.width)); }).catch(function () { cb('', 0); });
+      if (res.status !== 200 || !res.response) return cb('', 0, 0, 0);
+      createImageBitmap(res.response).then(function (bmp) {
+        var sh = any ? 2 : coverShape(bmp.width, bmp.height);
+        cb(sh ? coverData(bmp, maxW) : '', Math.min(maxW || COVER_W, bmp.width), sh, bmp.width);
+      }).catch(function () { cb('', 0, 0, 0); });
     },
-    onerror: function () { cb('', 0); }, ontimeout: function () { cb('', 0); } });
+    onerror: function () { cb('', 0, 0, 0); }, ontimeout: function () { cb('', 0, 0, 0); } });
 }
-// Mehrere mögliche Bildadressen der Reihe nach probieren, bis eine klappt (manche Seiten sperren das Original
-// hinter dem Bild-Proxy, manche Varianten gibt es nicht): erst die passende Größe, dann og:image, dann was die Seite zeigt
+/* Mehrere mögliche Bildadressen der Reihe nach probieren (manche Seiten sperren das Original hinter dem Bild-Proxy, manche
+   Varianten gibt es nicht, und nicht jede Adresse ist wirklich das Cover): Das erste Hochformat-Bild, das groß genug ist
+   (drei Viertel der Zielbreite), gewinnt. Sonst das beste, das dabei war: Hochformat vor fast quadratisch, dann das
+   breitere. Querformat nie. Höchstens 9 Adressen. */
 function shrinkAny(list, cb, maxW, ref) {
-  var seen = {}, urls = (list || []).filter(function (u) { if (!u || /^data:/.test(u) || seen[u]) return false; seen[u] = 1; return true; }), i = 0;
+  var seen = {}, urls = (list || []).filter(function (u) { if (!u || typeof u !== 'string' || /^data:/.test(u) || seen[u]) return false; seen[u] = 1; return true; }).slice(0, 9), i = 0;
+  var need = (maxW || COVER_W) * 0.75, alt = null;
   (function next() {
-    if (i >= urls.length) return cb('', 0);
-    shrink(urls[i++], function (d, w) { if (d) cb(d, w); else next(); }, maxW, ref);
+    if (i >= urls.length) return alt ? cb(alt.d, alt.w) : cb('', 0);
+    shrink(urls[i++], function (d, w, sh, ow) {
+      if (d && sh === 2 && ow >= need) return cb(d, w);
+      if (d && (!alt || sh > alt.sh || (sh === alt.sh && ow > alt.ow))) alt = { d: d, w: w, sh: sh, ow: ow };
+      next();
+    }, maxW, ref);
   })();
 }
-/* Weitere Stellen, an denen Seiten ihr Cover haben, wenn og:image fehlt (z. B. Seiten, die erst per JavaScript
-   aufgebaut werden, oder Cover als Hintergrundbild): itemprop/image_src, JSON-LD, Elemente mit „cover/thumb/poster“
-   in der Klasse (Bild darin oder Hintergrundbild), zuletzt eine Bildadresse in den Seitendaten. Ergebnis: Liste. */
+/* Weitere Stellen, an denen Seiten ihr Cover haben, wenn og:image fehlt oder kein Cover ist (z. B. Seiten, die erst per
+   JavaScript aufgebaut werden, oder Cover als Hintergrundbild): Bilder, deren Alt-Text der Titel ist, itemprop/image_src,
+   JSON-LD, Elemente mit „cover/thumb/poster“ in der Klasse (Bild darin oder Hintergrundbild), Bilder, die laut width/height
+   hochkant sind, zuletzt eine Bildadresse in den Seitendaten. Bilder in Links auf andere Serien (Empfehlungen) zählen
+   nicht. Ergebnis: Liste. */
 function bgUrl(el) {
   var st = (el.getAttribute && (el.getAttribute('style') || '')) || '', m = st.match(/background(?:-image)?\s*:[^;]*url\(\s*['"]?([^'")]+)['"]?\s*\)/i);
   return m ? m[1] : (el.getAttribute && (el.getAttribute('data-bg') || el.getAttribute('data-background') || el.getAttribute('data-bg-src'))) || '';
 }
-function docMoreCovers(doc, base) {
+// Steht das Element in einem Link auf eine andere Serie (Empfehlung, „Ähnliche“, Seitenleiste)?
+function foreignLink(el, page) {
+  var a = el.closest && el.closest('a[href]'); if (!a || !page) return false;
+  var u = absUrl(a.getAttribute('href'), page);
+  return isSeriesUrl(u) && canonUrl(u.replace(/\/$/, '')) !== canonUrl(String(page).split(/[?#]/)[0].replace(/\/$/, ''));
+}
+function imgUrlOf(im, need, base) {
+  var v = fitVariant(srcsetList(im.getAttribute('srcset') || im.getAttribute('data-srcset') || '', base), need || 600);
+  return v ? v.u : im.getAttribute('data-src') || im.getAttribute('data-lazy-src') || im.getAttribute('src') || '';
+}
+function docMoreCovers(doc, base, title, need) {
   var abs = function (h) { try { return h && !/^data:/.test(h) ? new URL(h, base).href : ''; } catch (e) { return ''; } }, out = [];
+  var tt = normT(title || ''), skip = function (el) { return foreignLink(el, base) || !!(el.closest && el.closest('nav,header,footer')); };
+  // Bild, dessen Alt-Text der Titel ist (oder ihn enthält: „Cover of …“)
+  if (tt.length >= 3) [].forEach.call(doc.querySelectorAll('img[alt]'), function (im) {
+    var al = normT(im.getAttribute('alt')); if (out.length > 3 || !al || al.length > tt.length + 24 || al.indexOf(tt) < 0 || skip(im)) return;
+    out.push(abs(imgUrlOf(im, need, base)));
+  });
   var m1 = doc.querySelector('meta[itemprop="image"],link[rel="image_src"]'); if (m1) out.push(abs(m1.getAttribute('content') || m1.getAttribute('href')));
   [].forEach.call(doc.querySelectorAll('script[type="application/ld+json"]'), function (sc) {
     try { var o = JSON.parse(sc.textContent || ''), im = o && (o.image || (o['@graph'] && o['@graph'][0] && o['@graph'][0].image)); if (im) out.push(abs(typeof im === 'string' ? im : im.url || (im[0] && (im[0].url || im[0])))); } catch (e) {}
   });
+  var cls = 0;
   [].forEach.call(doc.querySelectorAll('[class*="cover"],[class*="thumb"],[class*="poster"],[class*="series-image"],[class*="summary_image"]'), function (el) {
-    if (out.length > 12) return;
+    if (cls >= 4 || skip(el)) return;
+    cls++;
     var im = el.tagName === 'IMG' ? el : el.querySelector('img');
-    if (im) out.push(abs(im.getAttribute('data-src') || im.getAttribute('data-lazy-src') || im.getAttribute('src')));
+    if (im) out.push(abs(imgUrlOf(im, need, base)));
     out.push(abs(bgUrl(el)));
   });
-  [].forEach.call(doc.querySelectorAll('script:not([src])'), function (sc) {
-    var t = sc.textContent || ''; if (t.length > 3000000) return;
-    var m = t.match(/\\?"(?:cover|coverImage|cover_url|thumbnail|thumb|poster)\\?"\s*:\s*\\?"(https?:[^"\\]+?\.(?:jpe?g|png|webp|avif)[^"\\]*)/i);
-    if (m) out.push(abs(m[1].replace(/\\\//g, '/')));
+  // Laut width/height hochkant und nicht winzig: das erste solche Bild ist meist das Cover
+  var tall = 0;
+  [].forEach.call(doc.querySelectorAll('img[width][height]'), function (im) {
+    var w = +im.getAttribute('width'), h = +im.getAttribute('height');
+    if (tall >= 2 || !(w >= 150) || !(h >= w * 1.2) || h > w * 2 || skip(im)) return;
+    tall++; out.push(abs(imgUrlOf(im, need, base)));
   });
+  // Seitendaten: Feld „cover“/„thumbnail“/„poster“ … (JSON in Skripten, auch ohne Anführungszeichen am Namen, und in den
+  // props von Astro: "cover":[0,"https://…"]). Nur Stellen in der Nähe des Namens der Serie, die nächste zuerst (in den
+  // Daten stehen auch Cover anderer Serien: Empfehlungen, Rangliste)
+  var slug = slugBase(String(base || '').split(/[?#]/)[0]), hits = [];
+  var texts = [].map.call(doc.querySelectorAll('script:not([src])'), function (sc) { return sc.textContent || ''; })
+    .concat([].map.call(doc.querySelectorAll('astro-island[props]'), function (el) { return el.getAttribute('props') || ''; }));
+  texts.forEach(function (t) {
+    if (t.length > 3000000 || hits.length > 40) return;
+    var re = /(?:\\?"|\b)(?:cover|coverImage|cover_image|cover_url|coverUrl|thumbnail|thumbnailUrl|thumb|poster|posterUrl|featuredImage|featured_image|image|imageUrl|image_url)(?:\\?")?\s*:\s*(?:\[\s*0\s*,\s*)?\\?"(https?:[^"\\\s]{8,400})/gi, m, n = 0;
+    var low = null;
+    while ((m = re.exec(t)) && n++ < 40) {
+      // Abstand zum Namen der Serie (Adress-Name oder Titel), davor oder danach: das nächste Feld gehört am ehesten dazu
+      low = low || t.toLowerCase();
+      var d = 1e9;
+      [slug, tt.length >= 3 ? tt : ''].forEach(function (w) {
+        if (!w) return;
+        var a1 = low.lastIndexOf(w, m.index), a2 = low.indexOf(w, m.index);
+        if (a1 > -1) d = Math.min(d, m.index - a1); if (a2 > -1) d = Math.min(d, a2 - m.index);
+      });
+      hits.push({ u: m[1].replace(/\\\//g, '/'), d: d });
+    }
+  });
+  hits = hits.filter(function (h) { return h.d < 3000; }).sort(function (a, b) { return a.d - b.d; });
+  hits.slice(0, 3).forEach(function (h) { out.push(abs(h.u)); });
+  return out.filter(Boolean);
+}
+// og:image ist kein Cover, sondern eine Karte fürs Teilen: laut og:image:width/height quer (sicher), oder die Adresse
+// sieht nach einem erzeugten Bild aus (/og/, opengraph, social … – dann kommt sie nur ganz zuletzt dran)
+function ogCard(doc, ogU) {
+  var w = doc.querySelector('meta[property="og:image:width"]'), h = doc.querySelector('meta[property="og:image:height"]');
+  if (w && h && +w.content > 0 && +h.content > 0) return +w.content > +h.content * 1.25 ? 2 : 0;
+  var p = ''; try { var u = new URL(ogU); p = u.pathname + u.search; } catch (e) {}
+  return /(?:^|[\/_.-])(?:og|opengraph|open-graph|og-image|ogimage|social|share|twitter-card)(?:[\/_.?=-]|$)/i.test(p) ? 1 : 0;
+}
+/* Mögliche Cover einer abgerufenen Serienseite, beste zuerst (für shrinkAny): laut Profil (series.cover), og:image bzw.
+   dasselbe Bild in passender Größe (wenn og:image nicht nach Teilen-Karte aussieht), extra (Bild der Karte in der
+   Übersicht – sicher diese Serie), dann die weiteren Stellen der Seite. */
+function docCoverList(doc, page, need, title, extra) {
+  var out = [], og = doc.querySelector('meta[property="og:image"],meta[name="twitter:image"]'), ogU = '';
+  try { ogU = og && og.content ? new URL(og.content, page).href : ''; } catch (e) {}
+  var card = ogU ? ogCard(doc, ogU) : 0;
+  profEls(doc, 'series.cover').slice(0, 2).forEach(function (el) {
+    var im = el.tagName === 'IMG' ? el : el.querySelector && el.querySelector('img'), u = im ? imgUrlOf(im, need, page) : bgUrl(el);
+    try { if (u) out.push(new URL(u, page).href); } catch (e) {}
+  });
+  if (!card) out.push(docCoverUrl(doc, page, need, title), ogU);
+  out = out.concat(extra || [], docMoreCovers(doc, page, title, need));
+  if (card === 1) out.push(ogU);
   return out.filter(Boolean);
 }
 /* Passende Bildgröße wählen: aus srcset die kleinste Variante, die mindestens need Pixel breit ist (scharf nach dem
@@ -1777,6 +1884,7 @@ function docCoverUrl(doc, base, need, title) {
 // Bestes Cover der Seite: das Bild zum og:image (mit größter Variante aus srcset), sonst das größte Hochformat-Bild
 // oben auf der Seite, dessen Alt-Text zum Titel passt, sonst og:image. Als Liste zum Durchprobieren: dazu die Adresse,
 // die der Browser gerade anzeigt (klappt auch, wenn das Original gesperrt ist), und og:image
+// (ein og:image im Querformat – die Teilen-Karte – lässt shrinkAny fallen). Bilder in Links auf andere Serien zählen nicht.
 function pageCoverUrls() {
   var og = document.querySelector('meta[property="og:image"],meta[name="twitter:image"]'), ogU = og && og.content ? unproxy(og.content) : '';
   var base = function (u) { return String(u).split(/[?#]/)[0].split('/').pop(); };
@@ -1784,12 +1892,13 @@ function pageCoverUrls() {
   [].forEach.call(document.images, function (im) {
     var nw = im.naturalWidth, nh = im.naturalHeight; if (!nw || !nh) return;
     var r = im.getBoundingClientRect(); if (r.top + window.scrollY > 1800 || r.width < 100) return;
-    var ar = nw / nh, u = bestSrc(im); if (!u || ar < 0.5 || ar > 0.9) return;
+    var ar = nw / nh, u = bestSrc(im); if (!u || ar < 0.5 || ar > 0.9 || foreignLink(im, location.href)) return;
     var sc = nw + (ogU && base(u) === base(ogU) ? 1e5 : 0) + (title && im.alt && normT(im.alt) === normT(title) ? 5e4 : 0);
     if (sc > bw) { bw = sc; best = u; shown = im.currentSrc || im.src || ''; }
   });
   // Kein passendes <img>: Hintergrundbilder und weitere Stellen (Klasse cover/thumb/poster, JSON-LD, Seitendaten)
-  return [best, shown, ogU, og && og.content].concat(docMoreCovers(document, location.href));
+  var prof = profEls(document, 'series.cover').slice(0, 2).map(function (el) { var im = el.tagName === 'IMG' ? el : el.querySelector && el.querySelector('img'); return im ? bestSrc(im) : absUrl(bgUrl(el)); });
+  return prof.concat([best, shown, ogU, og && og.content], docMoreCovers(document, location.href, title));
 }
 function grabCover(force) {
   var key = location.origin + location.pathname, all = get(COV);
@@ -1883,12 +1992,12 @@ function scrapeCards() {
     if (!title) return;
     var text = card.innerText || card.textContent || '', rating = null, re = /(\d{1,2}[.,]\d{1,2})/g, m;
     while ((m = re.exec(text))) { var v = parseFloat(m[1].replace(',', '.')); if (v > 0 && v <= 10) { rating = v; break; } }
-    // Roman-Adresse geht vor: ein „Manhwa“-Abzeichen daneben gehört oft zu einer Empfehlung
-    var type = isNovelUrl(k) ? 'Novel' : badgeType(card);
+    // Roman (Adresse oder „[Novel]“ im Titel) geht vor: ein „Manhwa“-Abzeichen daneben gehört oft zu einer Empfehlung
+    var nov = isNovelPage(k, title), type = nov ? 'Novel' : badgeType(card);
     var chN = null, chU = null, chA = null;
     card.querySelectorAll('a[href]').forEach(function (a) {
       var u = absUrl(a.getAttribute('href')), n = chOf(u);
-      if (n != null && sameKind(u, k) && (chN == null || n > chN)) { chN = n; chU = u; chA = a; }
+      if (n != null && sameKind(u, k, nov) && (chN == null || n > chN)) { chN = n; chU = u; chA = a; }
     });
     // Karte zeigt beim neuesten Kapitel ein Schloss/Münzen (Thunder): nur dieses Kapitel als bezahlt melden
     var clk = null; if (chA && lockOfLink(chA)) { clk = {}; clk[String(chN)] = 0; }
@@ -1912,7 +2021,7 @@ function enrich(c, cb) {
 }
 function fromDoc(c, doc, cb) {
   bindProfile(doc, c.url);
-  var og = doc && doc.querySelector('meta[property="og:image"]'), ot = doc && doc.querySelector('meta[property="og:title"]'), pt = doc && profEl(doc, 'series.title');
+  var ot = doc && doc.querySelector('meta[property="og:title"]'), pt = doc && profEl(doc, 'series.title');
   var e = { title: (pt && textOf(pt)) || ogName(ot && ot.content) || c.title, rating: c.rating, ch: c.ch, chUrl: c.chUrl, img: '', site: hostOf(c.url) || location.hostname, t: Date.now(), feat: c.feat ? Date.now() : 0,
     g: [], desc: '', type: c.type || '', rel: [] };
   if (doc) {
@@ -1935,11 +2044,14 @@ function fromDoc(c, doc, cb) {
     e.g = mergeGenres(headGenres(doc), e.g);
     if (!e.g.length) e.g = jsonGenres(doc);
     var bt = doc.body ? (doc.body.textContent || '').slice(0, 40000) : '';
-    var ty = bt.match(/(?:type|typ)\s*:?\s*(manhwa|manga|manhua|novel|webtoon)/i);
+    // „Type: Manhwa“ als eigenes Wort (nicht „prototype novel“ mitten im Text)
+    var ty = bt.match(/(?:^|[^a-z])(?:type|typ)\s*:?\s*(manhwa|manga|manhua|novel|webtoon)(?![a-z])/i);
     if (ty) e.type = ty[1].charAt(0).toUpperCase() + ty[1].slice(1).toLowerCase();
     else if (!e.type) e.type = badgeType(doc.body);
     if (!e.type) e.type = jsonType(doc);
-    if (isNovelUrl(c.url)) e.type = 'Novel';
+    // Roman laut Adresse oder Titel geht vor; ein Comic, der nur „… Novel“ heißt, ist keiner (isNovelPage)
+    if (isNovelPage(c.url, e.title)) e.type = 'Novel';
+    else if (e.type === 'Novel' && c.type && c.type !== 'Novel') e.type = c.type;
     e.ss = siteStatus(doc) || jsonStatus(doc);
     e.alt = altNames(doc);
     // Bezahlte Kapitel (vollständige Sicht der Serienseite: ersetzt im Hub, was vorher bekannt war)
@@ -1949,20 +2061,32 @@ function fromDoc(c, doc, cb) {
   // 400 px breit: scharf in der Entdecken-Liste auch bei hoher Pixeldichte; hervorgehobene (fürs Karussell) 600 px.
   // Quelle in passender Größe (docCoverUrl), sonst das Bild der Karte
   // Klappt eine Adresse nicht (gesperrt, nicht da), die nächste: so fehlt kein Bild mehr
-  var big = !!c.feat, ogU = ''; try { ogU = og && og.content ? new URL(og.content, c.url).href : ''; } catch (er) {}
+  var big = !!c.feat;
   // Woher das Bild kam, merken (iu): damit kann der Hub es später neu holen lassen, auch wenn die Seite kein og:image hat
-  var cands = [doc && docCoverUrl(doc, c.url, big ? 900 : 600, e.title), ogU, c.imgSrc, c.imgRaw].concat(doc ? docMoreCovers(doc, c.url) : []);
+  var cands = doc ? docCoverList(doc, c.url, big ? 900 : 600, e.title, [c.imgSrc, c.imgRaw]) : [c.imgSrc, c.imgRaw];
   e.iu = c.imgSrc || c.imgRaw || '';
-  shrinkAny(cands, function (d, w) { e.img = d; e.q = d ? (big && w >= 570 ? 4 : 3) : 0; cb(e); }, big ? 600 : 400, c.url);
+  // Stufe q: 13 = auf Hochformat geprüft (ab 3.54; vorher 3 – da konnte die Teilen-Karte der Seite als Cover landen), 14 = groß
+  shrinkAny(cands, function (d, w) { e.img = d; e.q = d ? (big && w >= 570 ? 14 : 13) : 0; cb(e); }, big ? 600 : 400, c.url);
 }
-// Art (Manhwa, Novel …) aus einem Abzeichen lesen: ein Element, dessen Text genau so heißt
+// Art (Manhwa, Novel …) aus einem Abzeichen lesen: ein Element, dessen Text genau so heißt. Nicht in Menüs, Kopf- und
+// Fußzeile, nicht in Links auf andere Serien, und nicht, wenn gleich daneben eine andere Art steht (Filter „Manhwa · Manga · Novel“)
 function badgeType(root) {
   if (!root) return '';
-  var els = root.querySelectorAll('span,div,a,p,b,i,small,li');
-  for (var i = 0; i < els.length && i < 400; i++) {
+  var els = root.querySelectorAll('span,div,a,p,b,i,small,li,strong,em'), page = docUrl(root);
+  for (var i = 0, seen = 0; i < els.length && seen < 400; i++) {
     if (els[i].children.length) continue;
+    seen++;
     var t = (els[i].textContent || '').trim().toLowerCase();
-    if (/^(manhwa|manga|manhua|novel|webtoon)$/.test(t)) return t.charAt(0).toUpperCase() + t.slice(1);
+    if (!TYPE_W.test(t)) continue;
+    if (els[i].closest('nav,header,footer,select,form,[class*="menu"],[class*="filter"],[role="navigation"]')) continue;
+    if (root.tagName === 'BODY' && page && foreignLink(els[i], page)) continue;
+    var par = els[i].parentElement, grand = par && par.parentElement, other = false;
+    [par, grand].forEach(function (box) {
+      if (!box || other) return;
+      [].forEach.call(box.children, function (sib) { var st = (sib.textContent || '').trim().toLowerCase(); if (sib !== els[i] && !sib.contains(els[i]) && TYPE_W.test(st) && st !== t) other = true; });
+    });
+    if (other) continue;
+    return t.charAt(0).toUpperCase() + t.slice(1);
   }
   return '';
 }
@@ -2592,7 +2716,7 @@ function libEntry(key) {
 // Stand aus dem Hub, ergänzt um das, was du auf diesem Gerät seitdem gelesen hast
 function seriesState(e, base) {
   var st = { r: e.r || 0, c: e.c ? { n: e.c.n, pct: e.c.pct, url: '' } : null, u: e.u || '', n: e.n }, l = get(LOG);
-  Object.keys(l).filter(function (k) { return slugIn(k, base) && sameKind(k, location.href) && l[k].t > (e.at || 0); })
+  Object.keys(l).filter(function (k) { return slugIn(k, base) && sameKind(k, location.href, docNovel(document)) && l[k].t > (e.at || 0); })
     .sort(function (a, b) { return l[a].t - l[b].t; })
     .forEach(function (k) {
       var n = chOf(k); if (n == null) return;
@@ -2861,6 +2985,13 @@ function learnTitle(t) {
   if (!x || x.length > 200 || el === document.body) return null;
   var sel = uniqueSel(el); return sel ? { el: el, sel: sel, text: x } : null;
 }
+// Cover: das angetippte Bild (oder das Bild im angetippten Rahmen, oder ein Rahmen mit Hintergrundbild)
+function learnCover(t) {
+  var el = t.tagName === 'IMG' ? t : (t.querySelector && t.querySelector('img')) || (bgUrl(t) ? t : null);
+  if (!el || ownUi(el) || el === document.body) return null;
+  if (el.tagName === 'IMG' && el.naturalWidth && (el.naturalWidth < 100 || el.naturalWidth > el.naturalHeight * 1.25)) return null;
+  var sel = uniqueSel(el); return sel ? { el: el, sel: sel } : null;
+}
 function learnDesc(t) {
   var el = t;
   for (var i = 0; i < 3 && el.parentElement && tidy(el).length < 40; i++) el = el.parentElement;
@@ -3074,7 +3205,9 @@ function learnStart() {
       L('Dort steht keine Beschreibung. Tippe mitten in den Text.', 'No description there. Tap inside the text.'), true),
     one('chapters.lock', L('Kosten manche Kapitel etwas? Tippe auf ihr Schloss- oder Münz-Symbol.', 'Are some chapters paid? Tap their lock or coin icon.'),
       function (t) { return chap && learnLock(t, chap.links); }, function (r) { return L('Bezahlt: ', 'Paid: ') + r.n + L(' Kapitel markiert', ' chapters marked'); },
-      L('Das gehört zu keinem Kapitel oder steht bei fast allen. Tippe auf das Symbol eines bezahlten Kapitels.', 'Not part of a chapter, or on almost all of them. Tap the icon of a paid chapter.'), true, L('Keine bezahlten', 'None paid'))
+      L('Das gehört zu keinem Kapitel oder steht bei fast allen. Tippe auf das Symbol eines bezahlten Kapitels.', 'Not part of a chapter, or on almost all of them. Tap the icon of a paid chapter.'), true, L('Keine bezahlten', 'None paid')),
+    one('series.cover', L('Tippe auf das Cover der Serie.', 'Tap the cover of the series.'), learnCover, function () { return L('Cover erkannt', 'Cover found'); },
+      L('Das ist kein Cover. Tippe direkt auf das Bild der Serie (hochkant).', "That's not a cover. Tap the series image itself (portrait)."), true)
   ];
 
   // Antippen abfangen: die Seite bekommt währenddessen keine Klicks (keine Links, keine Werbung)
