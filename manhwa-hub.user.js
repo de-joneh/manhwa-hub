@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.54.0
+// @version      3.54.1
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var hubMark = !!document.querySelector('[data-mhub]'), isHub = false;
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.54.0';
+var VERSION = '3.54.1';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -31,6 +31,9 @@ var SERIES = /\/(?:series|manga|manhwa|manhua|comics?|title|webtoon|novels?)\/[^
 // Cover: Zielgröße und Qualitätsstufe (ältere Stufen werden einmal neu geholt). Hier oben, weil auch der Hub-Teil sie braucht
 // COVER_Q 3 (ab 3.54): Bild auf Hochformat geprüft (vorher konnte die Teilen-Karte der Seite als Cover landen)
 var COVER_W = 600, COVER_H = 800, COVER_Q = 3;
+// Seiten (Kapitel, Serien) immer ausdrücklich als HTML anfragen: Asura (Cloudflare) sperrt Abrufe ohne „text/html“ im
+// Accept (403, „Just a moment…“), dann kamen beim Endlos-Lesen, Wischen und Vorrat keine Bilder
+var HTML_HDR = { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' };
 var LOG = 'mhub_log', COV = 'mhub_cov', DISC = 'mhub_disc', LIB = 'mhub_lib', ADD = 'mhub_add';
 /* Konstanten, die auch der Hub-Teil (01-hub) braucht: Er endet mit return, bevor die übrigen Dateien ihre var-Zeilen
    ausführen. Funktionen sind dort überall nutzbar (hoisting), Variablen nur, wenn sie hier oben stehen. */
@@ -448,7 +451,7 @@ if (isHub || topMode) {
     return m ? m[1] : null;
   };
   var fetchText = function (url, cb) {
-    GM_xmlhttpRequest({ method: 'GET', url: url, timeout: 15000,
+    GM_xmlhttpRequest({ method: 'GET', url: url, timeout: 15000, headers: HTML_HDR,
       onload: function (r) { cb(r.status >= 200 && r.status < 300 ? String(r.responseText || '') : null); },
       onerror: function () { cb(null); }, ontimeout: function () { cb(null); } });
   };
@@ -1171,7 +1174,7 @@ function fetchChapter(u) {
   if (hostOf(u) && hostOf(u) !== location.hostname) return (pre[u] = { state: 'none', url: u, w: [], t: Date.now() });
   var e = pre[u] = { state: 'loading', url: u, w: [], t: Date.now() };
   var fin = function () { var w = e.w; e.w = []; w.forEach(function (f) { try { f(); } catch (er) {} }); };
-  fetch(u, { credentials: 'include' }).then(function (r) { return r.ok ? r.text() : ''; }).then(function (html) {
+  fetch(u, { credentials: 'include', headers: HTML_HDR }).then(function (r) { return r.ok ? r.text() : ''; }).then(function (html) {
     var doc = html ? new DOMParser().parseFromString(html, 'text/html') : null, imgs = html ? imgsFromHtml(html, doc) : [];
     // Gemerkt wird nur, was später gebraucht wird (Titel und Links fürs Weiter/Zurück), nicht die ganze Seite:
     // bis zu 8 Kapitel × ganze Seite als DOM kostete am Handy viel Arbeitsspeicher
@@ -2011,7 +2014,7 @@ function scrapeCards() {
 // Fund mit Details anreichern: Serienseite holen (oder, wenn du gerade darauf bist, die offene Seite nehmen)
 function enrich(c, cb) {
   if (c.url === canonUrl((location.origin + location.pathname).replace(/\/$/, ''))) return fromDoc(c, document, cb);
-  GM_xmlhttpRequest({ method: 'GET', url: c.url, timeout: 15000,
+  GM_xmlhttpRequest({ method: 'GET', url: c.url, timeout: 15000, headers: HTML_HDR,
     onload: function (r) {
       var doc = null;
       try { if (r.status === 200) doc = new DOMParser().parseFromString(r.responseText, 'text/html'); } catch (e) {}
