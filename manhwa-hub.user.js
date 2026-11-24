@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Manhwa Hub
 // @namespace    manhwa-hub
-// @version      3.54.1
+// @version      3.54.2
 // @description  Verbindet deine Scan-Seiten mit dem Manhwa Hub: Lesestand, Cover, neue Kapitel, Entdecken
 // @homepageURL  https://github.com/de-joneh/manhwa-hub
 // @updateURL    https://raw.githubusercontent.com/de-joneh/manhwa-hub/main/manhwa-hub.user.js
@@ -23,7 +23,7 @@ var hubMark = !!document.querySelector('[data-mhub]'), isHub = false;
 var GM_getValue = GM.GM_getValue, GM_setValue = GM.GM_setValue, GM_setClipboard = GM.GM_setClipboard,
     GM_xmlhttpRequest = GM.GM_xmlhttpRequest, GM_registerMenuCommand = GM.GM_registerMenuCommand,
     GM_addValueChangeListener = GM.GM_addValueChangeListener;
-var VERSION = '3.54.1';
+var VERSION = '3.54.2';
 var HUB_DEFAULT = 'https://claude.ai/artifact/8Ntpoy1ewrkkFitaHPioqk';
 var SITES = ['asura', 'thunder'];
 var CH = /(?:^|[^a-z])(?:chapter|chap|ch|kapitel|episode|ep)[-_\/ .]?\d/;
@@ -452,8 +452,9 @@ if (isHub || topMode) {
   };
   var fetchText = function (url, cb) {
     GM_xmlhttpRequest({ method: 'GET', url: url, timeout: 15000, headers: HTML_HDR,
-      onload: function (r) { cb(r.status >= 200 && r.status < 300 ? String(r.responseText || '') : null); },
-      onerror: function () { cb(null); }, ontimeout: function () { cb(null); } });
+      // fin: Adresse nach Weiterleitungen (umgezogene Seite), st: Status
+      onload: function (r) { cb(r.status >= 200 && r.status < 300 ? String(r.responseText || '') : null, r.finalUrl || url, r.status); },
+      onerror: function () { cb(null, url, 0); }, ontimeout: function () { cb(null, url, 0); } });
   };
   var scan = function (text, pt) {
     var best = null, m;
@@ -471,14 +472,29 @@ if (isHub || topMode) {
     var doc = null; try { doc = bindProfile(new DOMParser().parseFromString(t, 'text/html'), page); } catch (e) { return {}; }
     return lockedChapters(doc, page);
   };
+  /* Umgezogene Seite (Asura: asuracomic.net/series/… → asurascans.com/comics/…, alte Adressen landen auf der Startseite):
+     Serie auf der neuen Seite über deren Suche wiederfinden (findOn, Name aus der alten Adresse). Das Ergebnis trägt die
+     neue Kapitel-Adresse; daraus macht der Hub die neue Vorlage der Quelle, danach geht die Prüfung wieder direkt. */
+  var relocate = function (j, to, cb) {
+    var sp = seriesPage(j.tpl), name = sp ? decodeURIComponent(sp.split('/').pop()).replace(/-[a-z0-9]{6,10}$/i, function (m) { return /\d/.test(m) ? '' : m; }).replace(/[-_]+/g, ' ').trim() : '';
+    var o = ''; try { o = new URL(to).origin; } catch (e) {}
+    if (!name || !o || siteOff(o)) return cb(null);
+    findOn([name], { origin: o, host: hostOfU(o) }, function (r) {
+      var last = r && r.ch.length ? r.ch[r.ch.length - 1] : null;
+      cb(last ? { n: last[0], url: last[1], lk: r.lk || null } : null);
+    });
+  };
   var checkOne = function (j, cb) {
-    var sp = seriesPage(j.tpl), pt = pattern(j.tpl), urls = [sp, j.latest].filter(Boolean), i = 0;
+    var sp = seriesPage(j.tpl), pt = pattern(j.tpl), urls = [sp, j.latest].filter(Boolean), i = 0, moved = '';
     (function step() {
-      if (i >= urls.length) return cb(null);
+      if (i >= urls.length) return moved ? relocate(j, moved, cb) : cb(null);
       var u = urls[i++];
-      fetchText(u, function (t) {
+      fetchText(u, function (t, fin, st) {
         var b = t ? scan(t, pt) : null;
         if (b) { if (u === sp) b.lk = lockOfPage(t, sp); return cb(b); }
+        // Weitergeleitet auf eine andere Seite, oder die Serienseite gibt es hier nicht mehr (404)
+        if (!moved && fin && hostOfU(fin) && hostOfU(fin) !== hostOfU(u)) moved = fin;
+        else if (!moved && u === sp && st === 404) moved = u;
         step();
       });
     })();
